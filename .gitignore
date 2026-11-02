@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# 身份与数据库：绝对不要提交
+identity.json
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+
+# 本地策略（可能含项目代号/客户代号）
+policy.json
+
+# 环境变量与密钥
+.env
+.env.*
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store

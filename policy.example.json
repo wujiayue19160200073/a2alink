@@ -1,0 +1,22 @@
+{
+  "_说明": [
+    "本项目级别的出站策略。复制成 policy.json 后按需修改（JSON，不用 YAML 是为了零依赖）。",
+    "deny_terms  : 命中即硬阻断，不脱敏。用于项目代号、客户代号、绝密项目名。",
+    "allow_terms : 白名单，抑制误报（比如公司对外公开的客服邮箱）。慎用，别把敏感词加进来。",
+    "peer_scopes : 按对端 agent_id 指定信任域。local / lan / wan，未列出的默认 wan（最严）。",
+    "default_scope: 未显式配置时的默认信任域，保持 wan。"
+  ],
+  "deny_terms": [
+    "（示例）天枢计划",
+    "（示例）客户代号 ZX-9",
+    "（示例）尚未发布的型号 A7"
+  ],
+  "allow_terms": [
+    "support@example.com"
+  ],
+  "default_scope": "wan",
+  "peer_scopes": {
+    "agt-替换成内网研究Agent的id": "local",
+    "agt-替换成兄弟部门的Agent": "lan"
+  }
+}

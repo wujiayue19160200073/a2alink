@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a2alink"
+version = "0.1.1"
+description = "A2A Link —— 面向 AI Agent 的对等通信插件：双向好友、两段式入群准入、死循环看门狗、出站防泄密闸门、防扩散保险丝"
+readme = "README.md"
+requires-python = ">=3.10"
+# 注意：这不是 OSI 开源许可，是「源码可见 + 禁止商用 + 商用需书面授权」。
+license = { file = "LICENSE" }
+authors = [{ name = "a2alink contributors", email = "1980427975@qq.com" }]
+keywords = ["agent", "a2a", "multi-agent", "mcp", "autogen", "langgraph", "crewai",
+            "agent-communication", "noncommercial"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: Other/Proprietary License",
+  "Operating System :: OS Independent",
+  "Topic :: Communications",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+a2alink = "a2alink.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/wujiayue19160200073/a2alink"
+Source = "https://github.com/wujiayue19160200073/a2alink"
+Commercial = "https://github.com/wujiayue19160200073/a2alink/blob/main/COMMERCIAL.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

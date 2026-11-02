@@ -1,0 +1,5 @@
+# 统一用 LF 存仓，避免 Windows 上 checkout 后 diff 全变
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.sqlite3 binary
