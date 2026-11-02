@@ -13,6 +13,8 @@
 业务数据是否可出域必须由人判断。上线前请读 SECURITY.md。
 """
 
+from .audit import (AuditLog, DENY_REASONS, OVERRIDE_REASONS, REASONS,
+                    fingerprint, mask, scrub)
 from .protocol import (ACT_EVENT, ACT_NOTICE, ACT_RESULT, ACT_TASK, Budget,
                        Envelope, ProtocolError, make_task, new_id)
 from .watchdog import STOP, Watchdog, simhash
@@ -24,12 +26,14 @@ from .adapters import (AutoGenAdapter, DeepSeekHarnessAdapter, EchoAdapter,
                        LLMAdapter, TOOL_SPECS, bind_tools, parse_reply)
 from .registry import Registry, make_server, serve
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     "AgentLink", "EgressBlocked", "LinkError", "LoopHalt", "Received", "Sent",
     "Envelope", "Budget", "ProtocolError", "make_task", "new_id",
     "Watchdog", "simhash", "STOP",
+    "AuditLog", "REASONS", "DENY_REASONS", "OVERRIDE_REASONS",
+    "scrub", "mask", "fingerprint",
     "EgressGuard", "IngressGuard", "compliance_report", "ALLOW", "BLOCK", "REDACT",
     "PropagationGuard", "PropagationBlocked", "ProvenanceError",
     "EchoAdapter", "LLMAdapter", "DeepSeekHarnessAdapter", "AutoGenAdapter",

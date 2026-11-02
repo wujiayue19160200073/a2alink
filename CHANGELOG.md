@@ -6,6 +6,49 @@
 
 ---
 
+## [0.1.2] — 2026-11-02
+
+主题：**让"不是我干的"这句话说不出口——审计可追责。**
+
+### Added
+- **结构化审计链 `audit.py`**：每条裁决写一条 JSONL 记录，带
+  `seq / ts / trace / actor / decision / reason / detail / evidence / prev / h`。
+  哈希链 + 独立 `HEAD` 锚点，能检出改内容、删中间、换顺序、删尾部四类篡改。
+  设计取舍与局限见 [`docs/logging.md`](docs/logging.md)。
+- **27 个理由码（`REASONS`）**：拒绝自由文本理由。写不在表里的值直接抛
+  `AuditError`——因为"已处理""异常"这类日志在定责时等于没写。
+- **`a2alink logs {tail,search,verify,stats,export,seal}`**：可离线查，
+  不依赖注册中心（出问题时它往往正好连不上）。`--json` 输出不截断的原值。
+- **`a2alink trace <id>`**：一条消息的完整一生，本地决策链 + 服务端投递记录。
+  支持短 id 前缀匹配（表格里复制出来直接能查）。
+- **`a2alink incident`**：把"人工强行放行的"单独列在最前面，附完整理由；
+  "试图放行但没给理由被拒"也单独列——这是有价值的安全信号。
+- **服务端拒绝留痕**：`_dispatch` 单点记录每次 4xx/5xx，
+  带 `status / code / route / 调用者`。原来只记成功动作，被拒的请求一拍两散。
+- **`/v1/trace/<id>`**：服务端按 trace 回元数据，仅参与方可查，不回 payload。
+
+### Changed
+- **`force=True` 必须同时给 `force_reason`（≥8 字）**，否则抛
+  `force_requires_reason`。CLI 对应 `--force --reason "..."`。
+  不需要填理由的"强行放行"按钮，在真实团队里三个月内一定会变成默认操作。
+- `purge_old()` **不再删 `audit` 表**。审计与业务数据共用留存期，
+  等于给了"把 days 设成 0.01 洗证据"一条正规通道。
+- `override` 类记录的 `decision` 由 `deny` 改为 `note`——
+  `decision` 描述最终结果（放行了），闸门判定交给 `reason`。
+- 审计目录从"只扫当前目录"改为递归扫 `archive/`，否则 seal 之后
+  seq 从 1 重开，归档动作会把自己验成"证据已被破坏"。
+- 链锁从"pid 文件"改为**操作系统文件锁**。pid 文件在进程被杀后残留，
+  导致 CLI 每次执行都新开一条链，一屏全是链名。
+
+### Fixed
+- 日志里不再出现明文：默认 `preview_chars=0`，只存指纹、长度、命中规则名。
+  ID 类字段（`agt-` / `trace-` / `conv-`）原样保留——排查时"对端是谁"是第一要回答的问题。
+- `force_reason` 走白名单完整保留。之前被长度策略截成 `<str:23>`，
+  恰好把责任链上最关键的一环抹掉了。
+- `seal()` 的 `json.dump` 参数冲突导致崩溃（且在移动文件之后崩，留下半成品）。
+
+---
+
 ## [Unreleased] — v0.2.0 计划
 
 ### Added（计划）

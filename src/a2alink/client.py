@@ -36,7 +36,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .abuse import PropagationBlocked, PropagationGuard, ProvenanceError
-from .guard import (ALLOW, BLOCK, EgressGuard, GuardResult, IngressGuard,
+from .audit import AuditLog, fingerprint, mask
+from .guard import (ALLOW, BLOCK, REDACT, EgressGuard, GuardResult, IngressGuard,
                     SCOPE_LAN, SCOPE_LOCAL, SCOPE_WAN, LEVEL_ORDER)
 from .protocol import (ACT_NOTICE, ACT_RESULT, ACT_TASK, Budget, Envelope,
                        STAGE_DONE, TERMINAL_STAGES, make_task, new_id)
@@ -111,7 +112,10 @@ class AgentLink:
                  auto_register: bool = True,
                  timeout: float = 15.0,
                  propagation: Optional[PropagationGuard] = None,
-                 allow_forward: bool = False) -> None:
+                 allow_forward: bool = False,
+                 audit_log: Optional[AuditLog] = None,
+                 audit_preview: int = 0,
+                 audit_enabled: bool = True) -> None:
         self.registry = registry.rstrip("/")
         self.name = name or f"agent-{new_id()[:6]}"
         self.capabilities = capabilities or []
@@ -132,6 +136,25 @@ class AgentLink:
         self.agent_id = ""
         self.token = ""
         self._load_or_register(auto_register)
+
+        # 审计链放在 <home>/logs 下，与身份文件同级。
+        # 身份先加载，审计里的 actor 才有真名可写——否则日志里全是 "agent:?",
+        # 出事时第一句话就会变成"这条不知道是谁"。
+        self.audit = audit_log or AuditLog(
+            os.path.join(self.home, "logs"), f"agent:{self.agent_id}",
+            preview_chars=audit_preview, enabled=audit_enabled)
+        self.audit.write("agent.boot", "note", "agent.boot",
+                         detail={"agent": self.agent_id, "registry": self.registry,
+                                 "scope": peer_scope,
+                                 "preview_chars": audit_preview})
+
+    def _audit(self, event: str, decision: str, reason: str,
+               trace: Optional[str] = None, detail: Optional[Dict[str, Any]] = None,
+               evidence: Optional[Dict[str, Any]] = None,
+               preview: Optional[str] = None) -> None:
+        """写审计。审计未启用时静默跳过（enabled=False 是显式的降级选择）。"""
+        self.audit.write(event, decision, reason, trace=trace, detail=detail,
+                         evidence=evidence, preview=preview)
 
     # ------------------------------------------------------------------
     # 身份
@@ -312,25 +335,65 @@ class AgentLink:
              ttl_hops: int = 4, ttl_seconds: int = 600,
              max_messages: int = 12, max_tokens: int = 12000,
              capabilities: Optional[List[str]] = None,
-             force: bool = False, in_reply_to: Optional[str] = None,
+             force: bool = False, force_reason: str = "",
+             in_reply_to: Optional[str] = None,
              forwarded_from: Optional[str] = None) -> Sent:
         """发一条信封。内部顺序：DLP → 扩散保险丝 → 看门狗 → 网络。任何一步不过就不发。
 
-        force=True 只应在人明确确认"这段可以发"之后使用，并且会写审计日志。
-        forwarded_from 非空表示"这是别人的话"，默认会被直接拒绝（见 abuse.py）。
+        每一步的裁决都会写进审计链，包括"通过了"。
+        因为事后要证明的常常不是"我拦了"，而是"我查过"。
+
+        force=True 必须同时给 force_reason（≥8 字），否则直接拒绝。
+        这个限制不是为了难用人，是因为一个不需要填理由的"强行放行"按钮，
+        在真实团队里三个月内一定会变成默认操作。理由会进审计链，责任在人。
         """
+        trace = new_id("trace-")     # 在闸门之前生成：被拦的消息也要有可追溯的 ID
         peer = to if to.startswith(("agt-", "grp-")) else self.resolve(to)
         is_group = peer.startswith("grp-")
         scope = SCOPE_LAN if is_group else self._scope_for(peer)
         self.egress.scope = scope
+        fp = fingerprint(payload)
+        preview = str(payload.get("instruction", "") or "")
 
+        # ---------- 0) 强行放行必须给理由，否则不给发 ----------
+        if force and len(str(force_reason).strip()) < 8:
+            self._audit("gate.override", "drop", "egress.override", trace,
+                        detail={"peer": peer, "error": "force_without_reason",
+                                "given": str(force_reason)[:40]}, evidence=fp)
+            raise LinkError("force_requires_reason",
+                            "force=True 必须同时提供 force_reason（至少 8 个字），"
+                            "说明为什么这段内容经人确认可以出域。理由会写入审计链。")
+
+        # ---------- 1) 出站 DLP ----------
         egress, clean_payload = self.egress.check_payload(payload)
-        if egress.action == BLOCK and not force:
-            raise EgressBlocked(egress)
+        rules = sorted({f.rule for f in egress.findings})
+        base = {"peer": peer, "scope": scope, "act": act, "level": egress.level,
+                "rules": rules, "findings": len(egress.findings)}
+        if egress.action == BLOCK:
+            if not force:
+                self._audit("gate.egress", "deny", "egress.deny", trace,
+                            detail=base, evidence=fp, preview=preview)
+                raise EgressBlocked(egress)
+            self._audit("gate.egress", "note", "egress.override", trace,
+                        detail={**base, "force_reason": force_reason,
+                                "human_confirmed": True},
+                        evidence=fp, preview=preview)
+        elif egress.action == REDACT:
+            self._audit("gate.egress", "redact", "egress.redact", trace,
+                        detail=base, evidence=fp, preview=preview)
+        else:
+            self._audit("gate.egress", "allow", "egress.allow", trace,
+                        detail=base, evidence=fp, preview=preview)
 
-        # 转发闸门：默认关闭。要开必须显式 allow_forward=True，且强制署名来源。
+        # ---------- 2) 转发闸门与扩散保险丝 ----------
         if forwarded_from:
-            self.propagation.check_forward(forwarded_from)
+            try:
+                self.propagation.check_forward(forwarded_from)
+            except (PropagationBlocked, ProvenanceError) as e:
+                self._audit("gate.propagation", "deny", "propagation.deny_forward", trace,
+                            detail={"peer": peer, "from": forwarded_from,
+                                    "err": str(e)[:80]}, evidence=fp)
+                raise
             clean_payload = dict(clean_payload)
             clean_payload["_provenance"] = {"forwarded_from": forwarded_from,
                                             "stated_by": self.agent_id,
@@ -339,9 +402,17 @@ class AgentLink:
         try:
             self.propagation.check(
                 json.dumps(clean_payload, ensure_ascii=False, sort_keys=True), conv, peer)
-        except PropagationBlocked:
+            self._audit("gate.propagation", "allow", "propagation.allow", trace,
+                        detail={"conv": conv, "peer": peer}, evidence=fp)
+        except PropagationBlocked as e:
             if not force:
+                self._audit("gate.propagation", "deny", "propagation.deny_fanout", trace,
+                            detail={"conv": conv, "peer": peer, "err": str(e)[:80]},
+                            evidence=fp)
                 raise
+            self._audit("gate.propagation", "note", "propagation.override", trace,
+                        detail={"conv": conv, "peer": peer, "force_reason": force_reason,
+                                "human_confirmed": True}, evidence=fp)
 
         now = time.time()
         env = Envelope(
@@ -360,16 +431,46 @@ class AgentLink:
             ttl_hops=max(0, min(ttl_hops, 16)),
             budget=Budget(max_messages=max_messages, max_tokens=max_tokens),
             capabilities=list(capabilities or []),
-            trace_id=new_id("trace-"),
+            trace_id=trace,
         )
 
+        # ---------- 3) 循环治理 ----------
         verdict = self.wd.check_outbound(env)
-        if verdict.action == STOP and not force:
-            raise LoopHalt(verdict)
+        wdet = {"conv": conv, "peer": peer, "action": verdict.action,
+                "reasons": verdict.reasons[:4], "stats": verdict.stats}
+        if verdict.action == STOP:
+            if not force:
+                self._audit("gate.watchdog", "deny", "watchdog.deny", trace,
+                            detail=wdet, evidence=fp, preview=preview)
+                raise LoopHalt(verdict)
+            self._audit("gate.watchdog", "note", "watchdog.override", trace,
+                        detail={**wdet, "force_reason": force_reason,
+                                "human_confirmed": True}, evidence=fp, preview=preview)
+        elif verdict.action == DEGRADE:
+            self._audit("gate.watchdog", "note", "watchdog.degrade", trace,
+                        detail=wdet, evidence=fp)
+        else:
+            self._audit("gate.watchdog", "allow", "watchdog.allow", trace,
+                        detail=wdet, evidence=fp)
 
-        out = self._api("POST", "/v1/messages", {"envelope": env.to_dict()})
+        # ---------- 4) 真正出网 ----------
+        try:
+            out = self._api("POST", "/v1/messages", {"envelope": env.to_dict()})
+        except LinkError as e:
+            self._audit("wire.send", "deny", "wire.send_failed", trace,
+                        detail={"peer": peer, "code": e.code,
+                                "status": e.status, "msg": e.message[:80]},
+                        evidence=fp)
+            raise
+        dup = bool(out.get("duplicate"))
+        self._audit("wire.send", "note" if dup else "allow",
+                    "wire.duplicate" if dup else "wire.sent", trace,
+                    detail={"peer": peer, "to_type": env.to_type, "msg_id": env.id,
+                            "delivered_to": out.get("delivered_to", 0),
+                            "server_seq": out.get("seq", 0),
+                            "hops": env.ttl_hops}, evidence=fp)
         return Sent(env=env, delivered_to=out.get("delivered_to", 0),
-                    duplicate=out.get("duplicate", False), egress=egress,
+                    duplicate=dup, egress=egress,
                     verdict=verdict, seq=out.get("seq", 0))
 
     def send_text(self, to: str, text: str, act: str = ACT_TASK,
@@ -377,22 +478,90 @@ class AgentLink:
         return self.send(to, {"instruction": text}, act=act, stage=stage, **kw)
 
     def reply(self, received: "Received", payload: Dict[str, Any],
-              stage: str = STAGE_DONE, act: str = ACT_RESULT) -> Sent:
-        """标准回信：继承会话、递减 TTL、把预算用量还回去。"""
+              stage: str = STAGE_DONE, act: str = ACT_RESULT,
+              force: bool = False, force_reason: str = "") -> Sent:
+        """标准回信：继承会话、递减 TTL、把预算用量还回去。
+
+        回信复用原信封的 trace_id —— 一次对话的所有往返共用一条 trace，
+        排查时用 `a2alink trace <id>` 就能拉出完整时间线。
+        """
         env = received.env
         child = env.reply(self.agent_id, payload, act=act, stage=stage)
+        trace = child.trace_id or env.trace_id or new_id("trace-")
+        fp = fingerprint(payload)
+        preview = str(payload.get("instruction", "") or "")
+
+        if force and len(str(force_reason).strip()) < 8:
+            self._audit("gate.override", "drop", "egress.override", trace,
+                        detail={"peer": child.to_id, "error": "force_without_reason"},
+                        evidence=fp)
+            raise LinkError("force_requires_reason",
+                            "force=True 必须同时提供 force_reason（至少 8 个字）")
+
         egress, clean = self.egress.check_payload(payload)
+        rules = sorted({f.rule for f in egress.findings})
+        base = {"peer": child.to_id, "stage": stage, "rules": rules,
+                "level": egress.level, "conv": child.conversation_id}
         if egress.action == BLOCK:
-            raise EgressBlocked(egress)
+            if not force:
+                self._audit("gate.egress", "deny", "egress.deny", trace,
+                            detail=base, evidence=fp, preview=preview)
+                raise EgressBlocked(egress)
+            self._audit("gate.egress", "note", "egress.override", trace,
+                        detail={**base, "force_reason": force_reason,
+                                "human_confirmed": True}, evidence=fp, preview=preview)
+        elif egress.action == REDACT:
+            self._audit("gate.egress", "redact", "egress.redact", trace,
+                        detail=base, evidence=fp, preview=preview)
+        else:
+            self._audit("gate.egress", "allow", "egress.allow", trace,
+                        detail=base, evidence=fp, preview=preview)
         child.payload = clean
+
         # 回信也要过扩散保险丝：否则"先试探一次，然后靠自动回复扩散"就成了绕过口。
-        self.propagation.check(
-            json.dumps(clean, ensure_ascii=False, sort_keys=True),
-            child.conversation_id, child.to_id)
+        try:
+            self.propagation.check(
+                json.dumps(clean, ensure_ascii=False, sort_keys=True),
+                child.conversation_id, child.to_id)
+            self._audit("gate.propagation", "allow", "propagation.allow", trace,
+                        detail={"conv": child.conversation_id, "peer": child.to_id},
+                        evidence=fp)
+        except PropagationBlocked as e:
+            if not force:
+                self._audit("gate.propagation", "deny", "propagation.deny_fanout", trace,
+                            detail={"conv": child.conversation_id, "peer": child.to_id,
+                                    "err": str(e)[:80]}, evidence=fp)
+                raise
+            self._audit("gate.propagation", "note", "propagation.override", trace,
+                        detail={"conv": child.conversation_id, "force_reason": force_reason,
+                                "human_confirmed": True}, evidence=fp)
+
         verdict = self.wd.check_outbound(child)
+        wdet = {"conv": child.conversation_id, "action": verdict.action,
+                "reasons": verdict.reasons[:4]}
         if verdict.action == STOP:
-            raise LoopHalt(verdict)
-        out = self._api("POST", "/v1/messages", {"envelope": child.to_dict()})
+            if not force:
+                self._audit("gate.watchdog", "deny", "watchdog.deny", trace,
+                            detail=wdet, evidence=fp, preview=preview)
+                raise LoopHalt(verdict)
+            self._audit("gate.watchdog", "note", "watchdog.override", trace,
+                        detail={**wdet, "force_reason": force_reason,
+                                "human_confirmed": True}, evidence=fp)
+        else:
+            self._audit("gate.watchdog", "allow", "watchdog.allow", trace,
+                        detail=wdet, evidence=fp)
+
+        try:
+            out = self._api("POST", "/v1/messages", {"envelope": child.to_dict()})
+        except LinkError as e:
+            self._audit("wire.send", "deny", "wire.send_failed", trace,
+                        detail={"peer": child.to_id, "code": e.code,
+                                "msg": e.message[:80]}, evidence=fp)
+            raise
+        self._audit("wire.send", "allow", "wire.sent", trace,
+                    detail={"peer": child.to_id, "msg_id": child.id,
+                            "delivered_to": out.get("delivered_to", 0),
+                            "hops": child.ttl_hops}, evidence=fp)
         return Sent(env=child, delivered_to=out.get("delivered_to", 0),
                     egress=egress, verdict=verdict, seq=out.get("seq", 0))
 
@@ -405,13 +574,25 @@ class AgentLink:
         out: List[Received] = []
         for d in raw.get("items", []):
             seq = int(d.pop("_seq", 0))
+            trace_hint = str(d.get("trace_id") or "")
             try:
                 env = Envelope.from_dict(d)
-            except Exception:
-                continue    # 畸形信封直接丢弃，不进入上下文
+            except Exception as e:
+                # 畸形信封直接丢弃，不进入上下文。
+                # 但**必须留痕**：静默 continue 会让"一条消息凭空消失"
+                # 变成永远查不清的悬案，而它恰恰可能是攻击的第一发。
+                self._audit("wire.recv", "drop", "wire.dropped_malformed", trace_hint,
+                            detail={"seq": seq, "err": f"{type(e).__name__}",
+                                    "from": str(d.get("from_agent", ""))[:40]})
+                self._cursor = max(self._cursor, seq)
+                continue
 
             verdict = self.wd.check_inbound(env)
             if verdict.action == STOP:
+                self._audit("gate.watchdog", "deny", "watchdog.deny", env.trace_id,
+                            detail={"dir": "in", "conv": env.conversation_id,
+                                    "from": env.from_agent,
+                                    "reasons": verdict.reasons[:4]})
                 out.append(Received(env=env, seq=seq, verdict=verdict,
                                     text="", quarantine=False))
                 self._cursor = max(self._cursor, seq)
@@ -422,6 +603,18 @@ class AgentLink:
             if env.to_type == "group":
                 source += f"@group:{env.to_id}"
             ing, fenced = self.ingress.check_and_fence(env.payload_text(), source)
+            if ing.ok:
+                self._audit("gate.ingress", "allow", "ingress.allow", env.trace_id,
+                            detail={"from": env.from_agent, "to": env.to_id,
+                                    "act": env.act, "stage": env.stage, "seq": seq},
+                            evidence=fingerprint(env.payload_text()))
+            else:
+                self._audit("gate.ingress", "deny", "ingress.quarantine", env.trace_id,
+                            detail={"from": env.from_agent, "to": env.to_id,
+                                    "seq": seq,
+                                    "rules": sorted({f.rule for f in ing.findings})[:6]},
+                            evidence=fingerprint(env.payload_text()),
+                            preview=env.payload_text())
             out.append(Received(env=env, seq=seq, ingress=ing, verdict=verdict,
                                 text=fenced if ing.ok else "",
                                 quarantine=not ing.ok))
@@ -481,4 +674,7 @@ class AgentLink:
         return {"handled": handled, "replied": replied, "halted": halted}
 
     def close(self) -> None:
+        self._audit("agent.exit", "note", "agent.exit",
+                    detail={"cursor": self._cursor, "seq": self.audit._seq})
         self._save_identity()
+        self.audit.close()

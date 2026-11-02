@@ -344,5 +344,100 @@ class TestRegistryDirect(unittest.TestCase):
         self.assertTrue(any(x["action"] == "register" for x in log))
 
 
+class TestAuditTrail(unittest.TestCase):
+    """"不让管家推卸责任"的验收：闸门每一次动作都要在链上留下痕迹。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.reg = Registry(os.path.join(cls.tmp, "aud.sqlite3"))
+        cls.srv = make_server(cls.reg, port=0)
+        cls.port = cls.srv.server_address[1]
+        cls.url = f"http://127.0.0.1:{cls.port}"
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def client(self, name):
+        return AgentLink(registry=self.url, name=name,
+                         home=os.path.join(self.tmp, f"h_{name}"))
+
+    def befriend(self, a, b):
+        a.friend_request(b.name)
+        b.friend_accept(b.pending_requests()[0]["id"])
+
+    def test_blocked_message_is_audited_with_reason_code(self):
+        a, b = self.client("au-a"), self.client("au-b")
+        self.befriend(a, b)
+        with self.assertRaises(EgressBlocked):
+            a.send_text("au-b", "key 是 AKIAIOSFODNN7EXAMPLE")
+        recs = a.audit.read(limit=50, decision="deny")
+        hit = [r for r in recs if r["reason"] == "egress.deny"]
+        self.assertTrue(hit, "DLP 拦截必须留下理由码记录")
+        self.assertIn("cloud_ak", hit[0]["detail"]["rules"])
+        # 拦截记录里不能有明文密钥
+        raw = open(a.audit._path, encoding="utf-8").read()
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", raw)
+
+    def test_force_without_reason_is_refused_and_logged(self):
+        a, b = self.client("fr-a"), self.client("fr-b")
+        self.befriend(a, b)
+        with self.assertRaises(LinkError) as cm:
+            a.send_text("fr-b", "key 是 AKIAIOSFODNN7EXAMPLE", force=True)
+        self.assertEqual(cm.exception.code, "force_requires_reason")
+        recs = a.audit.read(limit=50, reason="egress.override")
+        self.assertTrue(any(r["decision"] == "drop" for r in recs),
+                        "无理由的强行放行尝试必须被记录下来")
+
+    def test_force_with_reason_is_logged_with_reason_text(self):
+        a, b = self.client("fok-a"), self.client("fok-b")
+        self.befriend(a, b)
+        why = "对方是甲方安全接口人，已电话确认可提供测试密钥"
+        a.send_text("fok-b", "key 是 AKIAIOSFODNN7EXAMPLE",
+                    force=True, force_reason=why)
+        recs = a.audit.read(limit=50, reason="egress.override")
+        rec = [r for r in recs if r["decision"] == "note"]
+        self.assertTrue(rec, "强行放行必须留痕")
+        self.assertEqual(rec[0]["detail"]["force_reason"], why)
+        self.assertTrue(rec[0]["detail"]["human_confirmed"])
+
+    def test_allowed_message_also_logged(self):
+        """"通过了"也要记——否则无法自证"我查过"。"""
+        a, b = self.client("ok-a"), self.client("ok-b")
+        self.befriend(a, b)
+        s = a.send_text("ok-b", "帮我看下 502")
+        # 客户端本地
+        recs = a.audit.read(limit=50, trace=s.env.trace_id)
+        reasons = [r["reason"] for r in recs]
+        self.assertIn("egress.allow", reasons)
+        self.assertIn("watchdog.allow", reasons)
+        self.assertIn("wire.sent", reasons)
+        # 服务端同一 trace 也查得到
+        tv = self.reg.trace_view(s.env.trace_id)
+        self.assertTrue(tv["messages"])
+        self.assertTrue(any(e.get("reason") == "server.accept" for e in tv["audit"]))
+
+    def test_server_records_rejections(self):
+        a = self.client("rj-a")
+        with self.assertRaises(LinkError):
+            a.send("agt-doesnotexist", {"instruction": "hi"})
+        audit = self.reg.audit_log(50)
+        rejects = [x for x in audit if x["action"] == "reject"]
+        self.assertTrue(rejects, "服务端拒绝必须留痕")
+        self.assertTrue(any(x["decision"] == "deny" for x in rejects))
+
+    def test_purge_keeps_audit(self):
+        """清理业务数据时不许顺手删审计——那是最好用的洗证据方式。"""
+        tmp = tempfile.mkdtemp()
+        reg = Registry(os.path.join(tmp, "p.sqlite3"))
+        reg.register("pa", [])
+        before = len(reg.audit_log(200))
+        reg.purge_old(days=0)
+        after = len(reg.audit_log(200))
+        self.assertGreaterEqual(after, before)
+
+
 if __name__ == "__main__":
     unittest.main()

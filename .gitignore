@@ -19,6 +19,11 @@ identity.json
 # 本地策略（可能含项目代号/客户代号）
 policy.json
 
+# 审计日志：即使默认不存原文，也绝不能进仓库
+logs/
+audit.*.jsonl
+HEAD.*
+
 # 环境变量与密钥
 .env
 .env.*

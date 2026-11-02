@@ -38,6 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
+from .audit import AuditLog
 from .protocol import Envelope, ProtocolError, new_id
 
 MAX_BODY = 1024 * 1024
@@ -169,7 +170,8 @@ class RegistryError(Exception):
 
 class Registry:
     def __init__(self, db_path: str = "a2alink.sqlite3",
-                 invite_code: Optional[str] = None) -> None:
+                 invite_code: Optional[str] = None,
+                 audit_enabled: bool = True) -> None:
         self.db_path = db_path
         d = os.path.dirname(os.path.abspath(db_path))
         if d:
@@ -185,6 +187,13 @@ class Registry:
         self._migrate()
         self.invite_code = invite_code
         self._rl: Dict[str, List[float]] = {}
+        # 服务端审计也落一条哈希链。为什么不只靠 SQLite：
+        # 数据库是"可 UPDATE、可 DELETE"的东西，一句 UPDATE audit SET detail=...
+        # 就能把证据改成对自己有利的样子，而没人看得出来。
+        # JSONL 哈希链的作用就是让"改过"这件事本身留下痕迹。
+        self.audit_chain = AuditLog(
+            os.path.join(d, "logs") if d else "logs", "service:registry",
+            preview_chars=0, enabled=audit_enabled)
 
     # 老库升级：v0.1.1 给 proposals/groups 加了字段，直接 ALTER 补上，
     # 不搞"删库重建"——那是在教用户丢数据。
@@ -196,6 +205,13 @@ class Registry:
         ("proposals", "consent", "TEXT NOT NULL DEFAULT 'pending'"),
         ("proposals", "consent_at", "REAL"),
         ("proposals", "consent_reason", "TEXT DEFAULT ''"),
+        # v0.1.2 审计可追责：给消息打 trace、给投递留失败原因、给审计加结构化字段。
+        # 老库直接补列，不重建表——审计表一旦重建，历史证据就没了。
+        ("messages", "trace_id", "TEXT DEFAULT ''"),
+        ("deliveries", "reason", "TEXT DEFAULT ''"),
+        ("audit", "decision", "TEXT DEFAULT 'note'"),
+        ("audit", "reason", "TEXT DEFAULT ''"),
+        ("audit", "trace", "TEXT DEFAULT ''"),
     )
 
     def _migrate(self) -> None:
@@ -218,9 +234,27 @@ class Registry:
             self.conn.commit()
             return cur
 
-    def audit(self, actor: Optional[str], action: str, detail: str = "") -> None:
-        self._x("INSERT INTO audit(ts, actor, action, detail) VALUES (?,?,?,?)",
-                (time.time(), actor, action, detail[:2000]))
+    def audit(self, actor: Optional[str], action: str, detail: str = "", *,
+              decision: str = "note", reason: str = "server.accept",
+              trace: str = "", extra: Optional[Dict[str, Any]] = None) -> None:
+        """服务端审计：SQLite 便于查询，JSONL 哈希链便于证明"没被改过"。
+
+        两处都写，不是因为冗余，是因为它们回答的是不同问题：
+        数据库回答"发生了什么"，哈希链回答"记录有没有被动过"。
+        只留数据库，一句 UPDATE 就能把拒绝改成通过，事后无从分辨。
+        """
+        now = time.time()
+        payload: Dict[str, Any] = {"action": action}
+        if extra:
+            payload.update(extra)
+        try:
+            self._x("""INSERT INTO audit(ts,actor,action,detail,decision,reason,trace)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (now, actor, action, detail[:2000], decision, reason, trace))
+        except sqlite3.Error:
+            pass    # 审计表异常不应打断业务；哈希链那条仍然会落盘
+        self.audit_chain.write(f"server.{action}", decision, reason, trace=trace,
+                             detail=payload, preview=detail)
 
     def rate_limit(self, agent_id: str, per_minute: int = 120) -> None:
         now = time.time()
@@ -803,13 +837,22 @@ class Registry:
         return out
 
     def purge_old(self, days: float = 30.0) -> Dict[str, int]:
-        """按留存策略清库。默认 30 天——"存着再说"是隐私事故的起点。"""
+        """按留存策略清消息与投递记录。
+
+        **审计表故意不在清理范围内**，这是刻意的，不是遗漏。
+        业务数据有留存期（存着是隐私负担），审计记录是责任链（删了就没法追责）。
+        两者共用同一个 cutoff 的话，谁都可以把 days 调成 0.01，
+        于是"系统自动清理"就成了最省事的洗证据方式。
+        审计要收缩，只能由人显式归档（`a2alink logs seal`），而归档动作本身也会留痕。
+        """
         cutoff = time.time() - float(days) * 86400
         d1 = self._x("DELETE FROM deliveries WHERE created_at<?", (cutoff,)).rowcount or 0
         d2 = self._x("DELETE FROM messages WHERE created_at<?", (cutoff,)).rowcount or 0
-        d3 = self._x("DELETE FROM audit WHERE ts<?", (cutoff,)).rowcount or 0
-        self.audit(None, "purge", f"days={days} msgs={d2} deliv={d1} audit={d3}")
-        return {"messages": d2, "deliveries": d1, "audit": d3}
+        self.audit(None, "purge", f"days={days} msgs={d2} deliv={d1} audit=kept",
+                   reason="server.purge",
+                   extra={"days": days, "messages": d2, "deliveries": d1,
+                          "audit_retained": True})
+        return {"messages": d2, "deliveries": d1, "audit": 0}
 
     # ------------------------------------------------------------------
     # 数据面：消息准入 + 投递
@@ -842,9 +885,11 @@ class Registry:
                     return {"duplicate": True, "message_id": ex[0]["message_id"],
                             "delivered_to": 0}
             cur = self._x("""INSERT INTO messages(id,from_agent,to_type,to_id,
-                             conversation_id,envelope,created_at) VALUES (?,?,?,?,?,?,?)""",
+                             conversation_id,envelope,created_at,trace_id)
+                             VALUES (?,?,?,?,?,?,?,?)""",
                           (env.id, me, env.to_type, env.to_id,
-                           env.conversation_id, env.to_json(), now))
+                           env.conversation_id, env.to_json(), now,
+                           env.trace_id or ""))
             mseq = cur.lastrowid
             for r in recipients:
                 self._x("""INSERT INTO deliveries(message_seq,recipient,state,created_at)
@@ -853,7 +898,12 @@ class Registry:
                 self._x("INSERT OR IGNORE INTO idem(key,message_id,created_at) VALUES (?,?,?)",
                         (env.idempotency_key, env.id, now))
         self.audit(me, "send", f"conv={env.conversation_id} to={env.to_type}:{env.to_id} "
-                               f"act={env.act} stage={env.stage} bytes={len(env.to_json())}")
+                               f"act={env.act} stage={env.stage} bytes={len(env.to_json())}",
+                   trace=env.trace_id or "",
+                   extra={"to": f"{env.to_type}:{env.to_id}", "act": env.act,
+                          "stage": env.stage, "msg_id": env.id,
+                          "recipients": len(recipients),
+                          "bytes": len(env.to_json())})
         return {"message_id": env.id, "seq": mseq, "delivered_to": len(recipients),
                 "duplicate": False}
 
@@ -883,6 +933,25 @@ class Registry:
         cur = self._x("UPDATE deliveries SET state='acked' WHERE recipient=? AND seq<=?"
                       " AND state='pending'", (me, cursor))
         return {"acked": cur.rowcount or 0, "cursor": cursor}
+
+    def trace_view(self, trace: str, limit: int = 500) -> Dict[str, Any]:
+        """按 trace_id 还原服务端这一侧的时间线。
+
+        边界说明：注册中心只看得见自己经手的东西。
+        客户端本地"为什么决定发这条"在各自 <home>/logs 里，不在这里——
+        这是隐私边界，不是功能缺失。注册中心没有资格读参与方的本地日志。
+        要全链路，用 `a2alink logs export` 从各端导出后合并。
+        """
+        rows = self._q("""SELECT seq,id,from_agent,to_type,to_id,conversation_id,
+                                 created_at FROM messages WHERE trace_id=? ORDER BY seq""",
+                       (trace,))
+        dels = self._q("""SELECT d.message_seq,d.recipient,d.state,d.reason,m.from_agent
+                          FROM deliveries d JOIN messages m ON m.seq=d.message_seq
+                          WHERE m.trace_id=? ORDER BY d.seq""", (trace,))
+        return {"trace": trace,
+                "messages": [dict(r) for r in rows],
+                "deliveries": [dict(r) for r in dels],
+                "audit": self.audit_chain.read(limit=limit, trace=trace)}
 
     def audit_log(self, limit: int = 200) -> List[Dict[str, Any]]:
         rows = self._q("SELECT * FROM audit ORDER BY seq DESC LIMIT ?", (max(1, min(1000, limit)),))
@@ -951,9 +1020,37 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _me(self) -> sqlite3.Row:
         row = self.registry.auth(self._token())
+        self.actor_id = row["id"]        # 缓存，供拒绝留痕时定位"是谁被拒了"
         self.registry.rate_limit(row["id"])
         self.registry.touch(row["id"])
         return row
+
+    def _actor(self) -> Optional[str]:
+        """尽力解析调用者身份，失败返回 None（未认证请求也要留痕）。"""
+        aid = getattr(self, "actor_id", None)
+        if aid:
+            return aid
+        try:
+            self.actor_id = self.registry.auth(self._token())["id"]
+            return self.actor_id
+        except Exception:
+            return None
+
+    def _reject(self, status: int, code: str, message: str, route: str) -> None:
+        """每一次拒绝都留痕。
+
+        为什么单独做这一步：服务端原来只记"成功做了什么"，
+        被拒的请求一拍两散。于是"我明明被拦了"和"根本没这回事"
+        两种说法谁也证不了。拒绝记录里带 status + code + 路由 + 调用者，
+        足以还原"谁在什么时候想做什么、被什么理由挡了"。
+        """
+        try:
+            self.registry.audit(self._actor(), "reject", f"{code} {route}", decision="deny",
+                                reason="server.reject",
+                                extra={"status": status, "code": code,
+                                       "route": route, "msg": message})
+        except Exception:
+            pass    # 审计失败不能把 4xx 变成 5xx，那会让问题更难查
 
     # ---- 路由 ----
     ROUTES: List[Tuple[str, str, str]] = [
@@ -980,6 +1077,7 @@ class _Handler(BaseHTTPRequestHandler):
         ("GET", r"^/v1/inbox$", "h_inbox"),
         ("POST", r"^/v1/inbox/ack$", "h_ack"),
         ("GET", r"^/v1/audit$", "h_audit"),
+        ("GET", r"^/v1/trace/(?P<tid>[A-Za-z0-9\-_]+)$", "h_trace"),
     ]
 
     def do_GET(self) -> None:  # noqa: N802
@@ -993,6 +1091,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method: str) -> None:
         parsed = urlparse(self.path)
+        route = f"{method} {parsed.path}"
         try:
             for m, pat, fn in self.ROUTES:
                 if m != method:
@@ -1003,14 +1102,18 @@ class _Handler(BaseHTTPRequestHandler):
                     qs = {k: v[0] for k, v in parse_qs(parsed.query).items()}
                     getattr(self, fn)(args, qs)
                     return
+            self._reject(404, "no_route", f"未知路由 {route}", route)
             self._err(404, "no_route", f"未知路由 {method} {parsed.path}")
         except RegistryError as e:
+            self._reject(e.status, e.code, e.message, route)
             self._err(e.status, e.code, e.message)
         except ProtocolError as e:
+            self._reject(400, "bad_envelope", str(e), route)
             self._err(400, "bad_envelope", str(e))
         except BrokenPipeError:
             pass
         except Exception as e:  # pragma: no cover - 兜底
+            self._reject(500, "internal", f"{type(e).__name__}: {e}", route)
             self._err(500, "internal", f"{type(e).__name__}: {e}")
 
     # ---- handlers ----
@@ -1156,6 +1259,25 @@ class _Handler(BaseHTTPRequestHandler):
 
     def h_audit(self, a, q) -> None:
         self._send(200, {"audit": self.registry.audit_log(int(q.get("limit", 200) or 200))})
+
+    def h_trace(self, a, q) -> None:
+        """按 trace 查服务端时间线。只有参与方有权查——排查不等于可以随便翻别人。"""
+        me = self._me()
+        tid = a["tid"]
+        d = self.registry.trace_view(tid, int(q.get("limit", 500) or 500))
+        involved = any(m["from_agent"] == me["id"] for m in d["messages"]) or \
+            any(x["recipient"] == me["id"] for x in d["deliveries"])
+        if not involved:
+            self._err(403, "forbidden", "你不是这条 trace 的参与方，无权查看")
+            return
+        # 只回元数据，不回 payload —— 查问题不需要把别人的正文再复制一遍。
+        self._send(200, {"trace": tid,
+                         "messages": d["messages"],
+                         "my_deliveries": [x for x in d["deliveries"]
+                                           if x["recipient"] == me["id"]],
+                         "audit": [e for e in d["audit"]
+                                   if e.get("actor") in (f"agent:{me['id']}",
+                                                         "service:registry")]})
 
 
 def make_server(registry: Registry, host: str = "127.0.0.1", port: int = 8787,

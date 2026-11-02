@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "a2alink"
-version = "0.1.1"
+version = "0.1.2"
 description = "A2A Link —— 面向 AI Agent 的对等通信插件：双向好友、两段式入群准入、死循环看门狗、出站防泄密闸门、防扩散保险丝"
 readme = "README.md"
 requires-python = ">=3.10"
