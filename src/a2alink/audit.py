@@ -90,16 +90,38 @@ REASONS: Dict[str, str] = {
     "wire.duplicate": "幂等键命中，服务端判定为重复投递",
     "wire.dropped_malformed": "信封格式非法，直接丢弃，未进入上下文",
     "wire.dropped_not_friend": "非好友消息被服务端拒绝（不应出现在客户端，出现即为异常）",
+    "wire.bad_signature": "入站信封签名校验失败，已拒收（内容被改或发送者身份不符）",
 
     # —— 入站围栏 ——
     "ingress.allow": "入站内容未检出注入特征，已加围栏标记后放行",
     "ingress.quarantine": "入站内容检出提示词注入特征，已隔离不进入上下文",
+
+    # —— 密码学（v0.2 公钥体系）——
+    "crypto.sealed": "出站信封已用对端交换公钥端到端加密，并已签名",
+    "crypto.plaintext": "出站信封未加密，仅签名（单聊但拿不到对端公钥）",
+    "crypto.group_plaintext": "群消息仅签名不加密（服务端 fan-out，v0.2 限制）",
+    "crypto.opened": "入站信封解密成功，签名此前已验证",
+    "crypto.decrypt_failed": "入站信封解密失败，已拒收（密钥不对或密文被篡改）",
+    "crypto.plaintext_inbound": "收到未加密的入站信封（对端可能未登记公钥）",
+    "crypto.signature_skipped": "按配置跳过了签名校验（高风险降级，需人工确认）",
+    "crypto.pin_new": "首次见到对端公钥并自动记录（TOFU，指纹未经带外核对）",
+    "crypto.pin_match": "对端公钥与本地固定值一致",
+    "crypto.key_changed": "对端公钥与本地固定值不一致，已拒收（可能是换钥匙或冒充）",
+    "crypto.key_rotated": "本机轮换了密钥对，旧私钥已归档",
+    "crypto.keys_published": "本机公钥已登记到注册中心",
 
     # —— 生命周期 ——
     "agent.boot": "客户端启动，审计链已接续",
     "agent.exit": "客户端退出，日志已落盘",
     "identity.loaded": "从本地身份文件恢复身份",
     "identity.registered": "向注册中心注册新身份",
+
+    # —— 服务端：签名与密钥 ——
+    "server.signature_ok": "服务端已用登记公钥验证信封签名",
+    "server.bad_signature": "服务端发现签名无效，拒绝投递",
+    "server.key_mismatch": "信封公钥与登记公钥不一致，拒绝投递",
+    "server.unsigned_rejected": "注册中心要求签名，但收到未签名信封，已拒绝",
+    "server.send_unsigned": "该身份未登记公钥，消息未签名（已在审计中标记）",
 
     # —— 服务端控制面 ——
     "server.accept": "服务端受理该请求",

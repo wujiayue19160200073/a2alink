@@ -183,8 +183,25 @@ def cmd_inbox(args: argparse.Namespace) -> int:
         tag = "🚫隔离" if r.quarantine else "✅"
         if r.verdict and r.verdict.action == "stop":
             tag = "⛔熔断"
+        # 密码学状态放在第一行可见位置。一条消息"是不是真的是他发的"
+        # 比"内容是什么"更需要先回答。
+        crypto_bits = []
+        crypto_bits.append("已验签" if r.authenticated else "⚠️未验签")
+        if r.decrypted:
+            crypto_bits.append("端到端加密")
+        elif not r.reject_reason:
+            crypto_bits.append("明文")
+        trust = (r.trust or {}).get("decision")
+        if trust in ("new", "match", "skipped"):
+            crypto_bits.append({"new": "首次固定", "match": "公钥一致",
+                                "skipped": "未校验公钥"}[trust])
+        elif trust:
+            crypto_bits.append(f"⚠️公钥{trust}")
         print(f"\n{tag} from={r.env.from_agent} act={r.env.act} stage={r.env.stage} "
               f"conv={r.env.conversation_id} hops={r.env.ttl_hops} seq={r.seq}")
+        print(f"   [{' · '.join(crypto_bits)}]")
+        if r.reject_reason:
+            print(f"   ⛔ 拒收原因：{r.reject_reason}")
         if r.verdict and r.verdict.reasons:
             print(f"   看门狗：{'; '.join(r.verdict.reasons)}")
         if r.ingress and r.ingress.findings:
@@ -470,6 +487,137 @@ def cmd_incident(args: argparse.Namespace) -> int:
     return 0
 
 
+def _home_of(args: argparse.Namespace) -> str:
+    """与 AgentLink 相同的 home 解析逻辑。密钥命令要能离线跑，
+    所以不能靠构造 client 来拿路径（构造 client 会去连注册中心）。"""
+    if getattr(args, "home", None):
+        return args.home
+    name = getattr(args, "name", None) or "default"
+    safe = "".join(c for c in name if c.isalnum() or c in "-_")[:40] or "default"
+    return os.path.join(os.path.expanduser("~"), ".a2alink", safe)
+
+
+def cmd_keys(args: argparse.Namespace) -> int:
+    from .crypto import CryptoError, KeyStore, fingerprint_of
+    from .trust import POLICIES, TrustStore
+
+    action = args.action
+    home = _home_of(args)
+    policy = getattr(args, "trust_policy", "tofu")
+
+    # ---------- 离线命令：不连注册中心 ----------
+    if action == "show":
+        ks = KeyStore(os.path.join(home, "keys")).load_or_create()
+        d = ks.describe()
+        print(f"身份目录  {home}")
+        print(f"签名指纹  {d['sign_fingerprint']}   ← 把它念给对方核对")
+        print(f"交换指纹  {d['kex_fingerprint']}")
+        print(f"签名公钥  {d['sign_pub']}")
+        print(f"交换公钥  {d['kex_pub']}")
+        print(f"私钥文件  {', '.join(d['private_files'])}")
+        print("\n公钥可以随便给；私钥永远不要复制、截图、提交仓库。")
+        return 0
+
+    if action == "list":
+        ts = TrustStore(os.path.join(home, "trust"), policy=policy)
+        rows = ts.list()
+        if not rows:
+            print("（还没有固定的对端公钥）")
+            return 0
+        print(f"{'agent':26} {'指纹':40} {'来源':10} 变更")
+        print("-" * 96)
+        for r in rows:
+            print(f"{r['agent_id']:26} {r.get('sign_fp',''):40} "
+                  f"{r.get('source',''):10} {len(r.get('changes') or [])} 次")
+        return 0
+
+    if action == "forget":
+        ts = TrustStore(os.path.join(home, "trust"), policy=policy)
+        if not args.yes:
+            print("删除固定记录之后，下次见面会重新走 TOFU，"
+                  "等于暂时放弃对这个对端的防冒充能力。加 --yes 确认。", file=sys.stderr)
+            return 2
+        ok = ts.forget(args.who)
+        print("已删除" if ok else "没有这条记录")
+        return 0 if ok else 1
+
+    # ---------- 需要连注册中心的命令 ----------
+    c = _client(args)
+
+    if action == "publish":
+        out = c._publish_keys(reason=args.reason or "手动上传公钥")
+        c._audit("crypto.keys", "allow", "crypto.keys_published",
+                 detail={"fp": out.get("key_fp", "")})
+        _p({"key_fp": out.get("key_fp"), "old_fp": out.get("old_fp"),
+            "note": out.get("warning") or "公钥已登记"})
+        return 0
+
+    if action == "rotate":
+        if not args.yes:
+            print("轮换会生成新密钥对，旧私钥归档到 keys/*.old。\n"
+                  "⚠️  轮换后所有对端都会因为指纹变化而拒收你的消息，\n"
+                  "    直到它们带外确认后重新 pin。加 --yes 确认。", file=sys.stderr)
+            return 2
+        out = c.keys.rotate()
+        c._audit("crypto.rotate", "note", "crypto.key_rotated",
+                 detail={"old_fp": out.get("old_fingerprint", ""),
+                         "new_fp": out.get("new_fingerprint", "")})
+        pub = c._publish_keys(reason="轮换密钥")
+        print(f"旧指纹  {out.get('old_fingerprint')}")
+        print(f"新指纹  {out.get('new_fingerprint')}")
+        print(f"归档为  keys/*.{out.get('archived_as')}.old")
+        print(f"\n已登记到注册中心。请把新指纹 {out.get('new_fingerprint')} "
+              f"通过带外渠道通知所有对端。")
+        return 0
+
+    if action == "peer":
+        info = c.peer_public(c.resolve(args.who), refresh=True)
+        if not info.get("sign_pub"):
+            print(f"注册中心没有 {args.who} 的公钥（对方可能是 0.1.x 版本）",
+                  file=sys.stderr)
+            return 1
+        from .crypto import b64d
+        print(f"agent    {c.resolve(args.who)}")
+        print(f"签名指纹 {fingerprint_of(b64d(info['sign_pub']))}")
+        if info.get("kex_pub"):
+            print(f"交换指纹 {fingerprint_of(b64d(info['kex_pub']))}")
+        print("\n⚠️  以上指纹来自注册中心，**未经核对**。")
+        print("    要真正防冒充，请通过另一个渠道（电话/当面/内部 IM）")
+        print("    向对方索取指纹并逐段比对，一致后再执行 keys pin。")
+        return 0
+
+    if action == "pin":
+        peer = c.resolve(args.who)
+        info = c.peer_public(peer, refresh=True)
+        if not info.get("sign_pub"):
+            print("拿不到对方公钥，无法固定", file=sys.stderr)
+            return 1
+        from .crypto import b64d
+        sign_pub = b64d(info["sign_pub"])
+        kex_pub = b64d(info["kex_pub"]) if info.get("kex_pub") else None
+        fp = fingerprint_of(sign_pub)
+        print(f"对端    {peer}")
+        print(f"待固定  {fp}")
+        if args.expect:
+            if args.expect.replace("-", "").lower() != fp.replace("-", "").lower():
+                print(f"\n❌ 指纹不匹配！你提供的 {args.expect}，"
+                      f"注册中心给的 {fp}。\n"
+                      f"   这可能是注册中心在换钥匙——不要继续，先查清楚。",
+                      file=sys.stderr)
+                return 6
+            print("✅ 与你提供的指纹一致")
+        if not args.yes:
+            print("\n确认这是对方的真实指纹后，加 --yes 写入固定记录。",
+                  file=sys.stderr)
+            return 2
+        out = c.trust.pin(peer, sign_pub, kex_pub, source="manual", note=args.note or "")
+        print(f"已固定 {out['fp']}" + ("（替换了旧记录）" if out["replaced"] else ""))
+        return 0
+
+    print(f"未知操作 {action}", file=sys.stderr)
+    return 2
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"a2alink {__version__} 自检\n" + "=" * 62)
     ok = True
@@ -514,6 +662,46 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             ok = False
         print(f"[7] 出站 DLP: {'启用' if c.egress else '未启用'}（fail-closed）")
         print(f"[8] 入站注入检测: {'启用' if c.ingress else '未启用'}")
+
+        # ---- 密码学状态：这几项才是 v0.2 之后最容易配错的地方 ----
+        print(f"[9] 签名指纹: {c.keys.signing.fingerprint}")
+        print(f"    加密策略: {c.encrypt} / 信任策略: {c.trust.policy}")
+        if c.encrypt == "never":
+            print("    ⚠️ encrypt=never：所有单聊都是明文，注册中心能读全文")
+            ok = False
+        if c.trust.policy == "off":
+            print("    ⚠️ trust_policy=off：不做公钥固定，注册中心可以冒充任何对端")
+            ok = False
+
+        key_dir = os.path.join(c.home, "keys")
+        perm_ok = True
+        if os.name != "nt":
+            for f in ("signing.key", "kex.key"):
+                p_ = os.path.join(key_dir, f)
+                if os.path.exists(p_) and (os.stat(p_).st_mode & 0o077):
+                    perm_ok = False
+                    print(f"    ❌ {f} 权限过宽，chmod 600 后再上线")
+                    ok = False
+        print(f"[10] 私钥权限: {'✅' if perm_ok else '❌'}（{key_dir}）")
+
+        trusted = c.trust.list()
+        manual = [t for t in trusted if t.get("source") == "manual"]
+        tofu_only = [t for t in trusted if t.get("source") != "manual"]
+        print(f"[11] 已固定对端: {len(trusted)} 个"
+              f"（人工核对 {len(manual)}，仅 TOFU {len(tofu_only)}）", end="")
+        if tofu_only:
+            print(f"\n    ⚠️ {len(tofu_only)} 个对端的指纹从未被人核对过，"
+                  f"首次通信可能被中间人利用\n"
+                  f"       核对方法：a2alink keys show 念给对方，"
+                  f"然后 a2alink keys pin <对端> --expect <指纹>")
+        else:
+            print("  ✅" if trusted else "  ⚠️ 还没有固定任何对端")
+
+        changed = [r for r in c.audit.read(limit=2000)
+                   if r.get("reason") == "crypto.key_changed"]
+        if changed:
+            print(f"[12] ⚠️ 近期有 {len(changed)} 次公钥变更被拒收 —— "
+                  f"可能是对方换机器，也可能是有人在冒充。用 `a2alink incident` 查。")
 
     print("\n" + COMPLIANCE_CHECKLIST)
     print("自检结论：" + ("✅ 基本可用（安全仍需人判）" if ok else "⚠️ 有项目需要处理"))
@@ -707,7 +895,34 @@ def build_parser() -> argparse.ArgumentParser:
     inc.add_argument("--list-max", type=int, default=20)
     inc.set_defaults(func=cmd_incident)
 
+    kp = sub.add_parser("keys", help="密钥与公钥固定（指纹/上传/轮换/pin）")
+    kss = kp.add_subparsers(dest="action", required=True)
+    kss.add_parser("show", help="查看本机公钥指纹（离线）")
+    kss.add_parser("list", help="列出已固定的对端公钥（离线）")
+    kw = kss.add_parser("forget", help="删除某条固定记录（离线）")
+    kw.add_argument("who")
+    kw.add_argument("--yes", action="store_true")
+    kp1 = kss.add_parser("publish", help="把本机公钥登记到注册中心")
+    kp1.add_argument("--reason", default="")
+    kr = kss.add_parser("rotate", help="轮换密钥对（会断开所有对端的信任）")
+    kr.add_argument("--yes", action="store_true")
+    kq = kss.add_parser("peer", help="查对端公钥指纹（来自注册中心，未核对）")
+    kq.add_argument("who")
+    kn = kss.add_parser("pin", help="固定对端公钥（带外核对后使用）")
+    kn.add_argument("who")
+    kn.add_argument("--expect", default="", help="你从其他渠道拿到的指纹，必须一致")
+    kn.add_argument("--note", default="", help="备注：从哪个渠道核对的")
+    kn.add_argument("--yes", action="store_true")
+    for _p_ in (kp1, kr, kq, kn):
+        _p_.add_argument("--trust-policy", default="tofu",
+                         choices=["tofu", "strict", "off"])
+    for _p_ in (kss.choices["show"], kss.choices["list"], kss.choices["forget"]):
+        _p_.add_argument("--trust-policy", default="tofu",
+                         choices=["tofu", "strict", "off"])
+    kp.set_defaults(func=cmd_keys)
+
     sub.add_parser("doctor", help="上线前自检").set_defaults(func=cmd_doctor)
+
     sub.add_parser("demo", help="30 秒演示").set_defaults(func=cmd_demo)
     return p
 
@@ -720,6 +935,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # guard / logs 不需要身份，提前分发，避免因连不上注册中心而失败。
     # 这条很重要：出问题的时候注册中心往往正好连不上，查日志不能被它拖住。
     if args.cmd in ("guard", "logs"):
+        return args.func(args)
+    # 密钥的离线命令同理：查指纹、看信任列表不该要求注册中心在线。
+    if args.cmd == "keys" and getattr(args, "action", "") in ("show", "list", "forget"):
         return args.func(args)
     try:
         return int(args.func(args) or 0)

@@ -6,6 +6,74 @@
 
 ---
 
+## [0.2.0] — 2026-11-03
+
+主题：**注册中心从"可以读、可以冒充"变成"只是个路由"。**
+
+v0.1 有两个绕不过去的硬伤：消息明文存在服务端 SQLite 里（谁拿到那台机器都能读），
+身份凭证是 bearer token（服务端自己能造一条"来自 alice"的消息）。这两个问题
+不能用"加个开关"解决，只能上公钥体系。
+
+### Added
+- **`crypto.py`：Ed25519 签名 + X25519 密钥交换 + HKDF-SHA256 + 认证加密**，
+  零第三方依赖，纯 Python 实现。
+  - Ed25519 逐条通过 RFC 8032 §7.1 的三组测试向量
+  - X25519 通过 RFC 7748 §5.2 与 §6.1
+  - HKDF 通过 RFC 5869 Test Case 1
+  - 加密用 **PRF-CTR + Encrypt-then-MAC**，而非手写 AES-GCM：
+    HMAC-SHA256 作 PRF 是 stdlib 现成且有证明的构造，出错空间远小于手写 S 盒。
+- **`trust.py`：对端公钥固定**，策略 `tofu / strict / off`。
+  首次见面记录指纹，之后指纹变化**一律拒收**并写审计（`crypto.key_changed`）。
+- **`a2alink keys {show,list,forget,publish,rotate,peer,pin}`**。
+  `show/list/forget` 可离线跑；`pin --expect <指纹>` 在你提供的指纹与
+  注册中心不一致时**直接失败**，防止 pin 退化成"注册中心说什么我信什么"。
+- **信封新增 `pub` / `enc` 字段**，签名覆盖二者——否则可以替换密文块、
+  或把发送者换一个人而签名依然有效。
+- **加密的 AAD 绑定信封头部**（from/to/conversation_id/act/stage/时间戳），
+  密文搬不到别的会话或别人身上。
+- **服务端入站验签**（`Registry._verify_envelope`）：用**库里登记的公钥**验，
+  而不是信封自带的那把。`require_signature` 默认 `True`。
+- **`PUT /v1/agents/me/keys`**：轮换公钥。用 PUT 而非 POST——换公钥是幂等操作。
+- **`Received` 新增 `authenticated / decrypted / trust / reject_reason`**。
+  被拒的消息也会返回（`quarantine=True`, `text=""`），让调用方看得见"有人试图冒充"，
+  而不是凭空消失。
+- **11 个新审计理由码**：`crypto.sealed / crypto.group_plaintext / crypto.key_changed /
+  wire.bad_signature` 等。
+- **`docs/crypto.md`**：威胁模型（含**挡不住的 6 类**）、带外验证流程、
+  密钥管理等运维清单。
+
+### Changed
+- **消息默认端到端加密**（`encrypt="auto"`）：单聊自动用对端交换公钥加密；
+  `always` 拿不到公钥就拒发；`never` 只签名。
+- **接收顺序改为 验签 → 公钥固定 → 解密 → 看门狗 → 入站围栏**。
+  先解密再验签会让未认证的密文先消耗一次椭圆曲线运算（CPU 耗尽），
+  且解密结果已经进过内存。
+- **发送顺序保持 看门狗在加密前**。加密后 payload 只剩占位符，
+  内容指纹去重会失效——"两个 Agent 互相发乱码"就会被当成不同内容放行。
+- `Envelope.canonical_bytes()` 明确纳入 `pub` / `enc`；签名加域前缀
+  `a2alink/v1/envelope\0` 防止跨协议复用。
+- `public_agent()` 返回 `sign_pub / kex_pub / key_fp`（公钥是公开信息）。
+
+### Fixed
+- **Windows 上私钥文件偶发损坏**：`os.open` 默认文本模式，私钥随机字节里的
+  `0x0A` 被写成 `0x0D 0x0A`，32 字节变 33 字节。32 字节随机数含 `0x0A` 的概率
+  约 12%——表现为"偶尔有人的密钥文件读不出来"，Linux 上永远复现不了。
+  现在显式带 `O_BINARY`，并有回归测试。
+- `KeyStore.rotate()` 里给只读 property 赋值导致崩溃。
+- AEAD 的 `os.write` 部分写未处理（大 payload 时可能截断）。
+
+### Known limitations（写在这里，不藏在文档里）
+- **纯 Python 不是常量时间实现**：能挡远程攻击者，**挡不住同机恶意进程或 root**。
+  要防这个必须换 OpenSSL 后端，本项目刻意不做"自动降级"——两条路径里
+  总有一条很久没被测试。
+- **群消息只签名不加密**：服务端 fan-out 导致无法端到端加密，
+  正确做法是 sender key（v0.3）。在此之前群聊按"会议室"对待。
+- **元数据可见**：注册中心知道谁在何时和谁通信、消息多大。
+  这是路由的必然代价。
+- **首次见面的中间人**：TOFU 固有问题，只能靠带外核对指纹解决。
+
+---
+
 ## [0.1.2] — 2026-11-02
 
 主题：**让"不是我干的"这句话说不出口——审计可追责。**

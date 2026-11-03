@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import time
@@ -135,6 +136,12 @@ class Envelope:
     capabilities: List[str] = field(default_factory=list)  # 本条消息请求的能力
     trace_id: Optional[str] = None
     signature: Optional[str] = None
+    # 发送者公钥。⚠️ 它的作用**不是**"我拿出公钥所以你该信我"——那是自签
+    # 自验的死循环。真正的信任来自接收方本地的公钥固定（pin，见 crypto.pin）。
+    # 放在信封里只是省一次往返，并让"这一版用的哪把钥匙"可追溯。
+    pub: Optional[Dict[str, str]] = None
+    # 端到端加密块。存在即表示 payload 已被加密（payload 只剩占位）。
+    enc: Optional[Dict[str, str]] = None
     v: str = PROTOCOL_VERSION
 
     # ---------------- 序列化 ----------------
@@ -157,6 +164,8 @@ class Envelope:
             "capabilities": list(self.capabilities),
             "trace_id": self.trace_id,
             "payload": self.payload,
+            "pub": self.pub,
+            "enc": self.enc,
             "signature": self.signature,
         }
 
@@ -164,14 +173,105 @@ class Envelope:
         return json.dumps(self.to_dict(), ensure_ascii=False, separators=(",", ":"))
 
     def canonical_bytes(self) -> bytes:
-        """签名用字节流：排除 signature 本身，字段顺序固定。"""
+        """签名用字节流：排除 signature 本身，字段顺序固定。
+
+        覆盖范围包括 pub 与 enc——否则攻击者可以替换密文块、或把
+        "谁发的"换一个人而签名依然有效。
+        """
         d = self.to_dict()
         d.pop("signature", None)
         return json.dumps(d, ensure_ascii=False, sort_keys=True,
                           separators=(",", ":")).encode("utf-8")
 
+    def aad_bytes(self) -> bytes:
+        """加密的附加认证数据：只绑头部，不绑 payload/enc。
+
+        目的：让"这条密文属于哪个会话、从谁到谁、什么时候过期"不可篡改。
+        不绑 payload 是因为 payload 正是要加密的内容本身。
+        """
+        head = {
+            "id": self.id, "from": self.from_agent,
+            "to": {"type": self.to_type, "id": self.to_id},
+            "act": self.act, "stage": self.stage,
+            "conv": self.conversation_id, "trace": self.trace_id,
+            "iat": int(self.created_at), "exp": int(self.expires_at),
+            "ttl": self.ttl_hops,
+        }
+        return b"a2alink/v1/aad\x00" + json.dumps(
+            head, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
     def fingerprint(self) -> str:
         return hashlib.sha256(self.canonical_bytes()).hexdigest()[:16]
+
+    # ---------------- 密码学 ----------------
+    # 域分隔符：签名只对"信封"这一种结构有效。没有它，同一把私钥签出的
+    # 字节可以在别的协议里被复用（跨协议签名伪造）。
+    SIG_DOMAIN = b"a2alink/v1/envelope\x00"
+
+    def sign(self, keystore: Any) -> None:
+        """用本机私钥签名。必须先 seal_for() 再 sign()，顺序反了签名就废。"""
+        from .crypto import b64e
+        self.pub = {"alg": "ed25519+x25519",
+                    "sign": keystore.signing.public_b64,
+                    "kex": keystore.kex.public_b64}
+        self.signature = b64e(keystore.sign(self.SIG_DOMAIN + self.canonical_bytes()))
+
+    def verify(self, expected_sign_pub: Optional[bytes] = None) -> Dict[str, bytes]:
+        """验签。返回对端公钥（sign/kex）。
+
+        传入 expected_sign_pub 时做**公钥固定**比对——这一步才是真正
+        防注册中心冒充的地方。只验"签名自洽"是没用的，因为攻击者可以
+        自己生成一对密钥，签完把公钥一起发过来，自签自验永远通过。
+        """
+        from .crypto import (Ed25519KeyPair, KeyMismatchError, SignatureError,
+                             b64d, fingerprint_of)
+        if not self.signature:
+            raise SignatureError("信封没有签名（对方可能用的是 0.1.x，或有人在剥离签名）")
+        if not isinstance(self.pub, dict) or not self.pub.get("sign"):
+            raise SignatureError("信封没有携带发送者公钥，无法验签")
+        try:
+            pub = b64d(self.pub["sign"])
+            sig = b64d(self.signature)
+        except Exception as e:
+            raise SignatureError(f"公钥或签名编码非法: {e}") from e
+        if len(pub) != 32 or len(sig) != 64:
+            raise SignatureError("公钥或签名长度非法")
+        if expected_sign_pub is not None and not hmac.compare_digest(pub, expected_sign_pub):
+            raise KeyMismatchError(
+                f"公钥与本地固定值不一致（收到 {fingerprint_of(pub)}，"
+                f"本地 {fingerprint_of(expected_sign_pub)}）。"
+                "这可能是对方换了钥匙，也可能是有人在冒充——先带外确认再更新。")
+        if not Ed25519KeyPair.verify(pub, self.SIG_DOMAIN + self.canonical_bytes(), sig):
+            raise SignatureError("签名校验失败：内容被改动，或发送者不是自称的那个人")
+        kex = b64d(self.pub["kex"]) if self.pub.get("kex") else b""
+        if kex and len(kex) != 32:
+            raise SignatureError("交换公钥长度非法")
+        return {"sign_pub": pub, "kex_pub": kex}
+
+    def seal_payload(self, recipient_kex_pub: bytes) -> None:
+        """把 payload 加密给指定接收方。加密后 payload 只剩占位符。"""
+        from .crypto import encrypt_for
+        plaintext = json.dumps(self.payload, ensure_ascii=False,
+                               sort_keys=True).encode("utf-8")
+        self.enc = encrypt_for(recipient_kex_pub, plaintext, self.aad_bytes())
+        self.payload = {"_enc": True}
+
+    def open_payload(self, my_kex: Any) -> Dict[str, Any]:
+        """解密 payload。没加密就原样返回。"""
+        from .crypto import DecryptionError, decrypt_from
+        if not self.enc:
+            return self.payload
+        pt = decrypt_from(my_kex, my_kex.public_bytes, self.enc, self.aad_bytes())
+        try:
+            d = json.loads(pt.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise DecryptionError(f"解密成功但内容不是合法 JSON: {e}") from e
+        if not isinstance(d, dict):
+            raise DecryptionError("解密后的 payload 不是 object")
+        return d
+
+    def is_encrypted(self) -> bool:
+        return bool(self.enc)
 
     def payload_text(self) -> str:
         """把载荷压成一段纯文本，供看门狗做指纹、供护栏做检测。"""
@@ -259,6 +359,32 @@ class Envelope:
         if not isinstance(payload, dict):
             raise ProtocolError("payload 必须是 object")
 
+        pub = d.get("pub")
+        if pub is not None:
+            if not isinstance(pub, dict):
+                raise ProtocolError("pub 必须是 object")
+            s = pub.get("sign")
+            k = pub.get("kex")
+            if not isinstance(s, str) or len(s) > 128:
+                raise ProtocolError("pub.sign 非法")
+            if k is not None and (not isinstance(k, str) or len(k) > 128):
+                raise ProtocolError("pub.kex 非法")
+
+        enc = d.get("enc")
+        if enc is not None:
+            if not isinstance(enc, dict):
+                raise ProtocolError("enc 必须是 object")
+            for f in ("epk", "n", "ct", "tag"):
+                v = enc.get(f)
+                if not isinstance(v, str) or len(v) > 96 * 1024:
+                    raise ProtocolError(f"enc.{f} 非法")
+            if not isinstance(enc.get("alg"), str) or len(enc["alg"]) > 64:
+                raise ProtocolError("enc.alg 非法")
+            # 加密信封的 payload 应当是占位符。不是的话，说明有人在
+            # "加密"的同时把明文也留在里面——典型的低级泄密事故。
+            if payload and payload != {"_enc": True}:
+                raise ProtocolError("信封同时带了密文和明文 payload，拒绝接收")
+
         def need_num(k: str) -> float:
             v = d.get(k)
             if not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0:
@@ -290,6 +416,8 @@ class Envelope:
             capabilities=list(d.get("capabilities") or []),
             trace_id=d.get("trace_id"),
             signature=d.get("signature"),
+            pub=pub,
+            enc=enc,
         )
         if not isinstance(env.capabilities, list) or not all(isinstance(c, str) for c in env.capabilities):
             raise ProtocolError("capabilities 必须是字符串数组")

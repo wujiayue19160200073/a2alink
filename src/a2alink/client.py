@@ -37,10 +37,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .abuse import PropagationBlocked, PropagationGuard, ProvenanceError
 from .audit import AuditLog, fingerprint, mask
+from .crypto import (CryptoError, DecryptionError, KeyMismatchError,
+                     KeyStore, SignatureError, b64d, b64e as _b64e,
+                     fingerprint_of)
 from .guard import (ALLOW, BLOCK, REDACT, EgressGuard, GuardResult, IngressGuard,
                     SCOPE_LAN, SCOPE_LOCAL, SCOPE_WAN, LEVEL_ORDER)
 from .protocol import (ACT_NOTICE, ACT_RESULT, ACT_TASK, Budget, Envelope,
                        STAGE_DONE, TERMINAL_STAGES, make_task, new_id)
+from .trust import (MATCH, MISMATCH, NEW, POLICY_TOFU, TrustStore, UNKNOWN)
 from .watchdog import DEGRADE, PASS, STOP, Verdict, Watchdog
 
 
@@ -77,6 +81,11 @@ class Sent:
     egress: Optional[GuardResult] = None
     verdict: Optional[Verdict] = None
     seq: int = 0
+    # 发送前的明文 payload。env.payload 在加密后只剩占位符，
+    # 想回看的调用方应该读这里（只在本进程内存里，不落盘）。
+    plaintext: Optional[Dict[str, Any]] = None
+    encrypted: bool = False
+    kex_source: str = "none"
 
 
 @dataclass
@@ -87,10 +96,19 @@ class Received:
     verdict: Optional[Verdict] = None
     text: str = ""          # 已围栏化的安全文本
     quarantine: bool = False
+    # 密码学状态。调用方应当先看这三个字段，再看 text。
+    authenticated: bool = False          # 签名是否验过
+    decrypted: bool = False              # 是否是解密得到的
+    trust: Optional[Dict[str, Any]] = None   # 公钥固定判定（new/match/mismatch/...）
+    reject_reason: str = ""              # 非空表示这条被拒收，text 必为空
 
     def to_dict(self) -> Dict[str, Any]:
         return {"envelope": self.env.to_dict(), "text": self.text,
                 "quarantine": self.quarantine,
+                "authenticated": self.authenticated,
+                "decrypted": self.decrypted,
+                "trust": self.trust,
+                "reject_reason": self.reject_reason,
                 "ingress": self.ingress.to_dict() if self.ingress else None,
                 "verdict": self.verdict.to_dict() if self.verdict else None}
 
@@ -115,7 +133,10 @@ class AgentLink:
                  allow_forward: bool = False,
                  audit_log: Optional[AuditLog] = None,
                  audit_preview: int = 0,
-                 audit_enabled: bool = True) -> None:
+                 audit_enabled: bool = True,
+                 encrypt: str = "auto",
+                 trust_policy: str = POLICY_TOFU,
+                 require_signature: bool = True) -> None:
         self.registry = registry.rstrip("/")
         self.name = name or f"agent-{new_id()[:6]}"
         self.capabilities = capabilities or []
@@ -135,6 +156,18 @@ class AgentLink:
         self._cursor = 0
         self.agent_id = ""
         self.token = ""
+
+        # ---------- 密码学身份 ----------
+        # 密钥必须在注册**之前**加载：注册请求要把公钥一起交上去。
+        # 私钥永远只在本机 <home>/keys/ 里，没有任何一条代码路径会把它发出去。
+        if encrypt not in ("auto", "always", "never"):
+            raise LinkError("bad_config", "encrypt 只能是 auto / always / never")
+        self.encrypt = encrypt
+        self.require_signature = bool(require_signature)
+        self.keys = KeyStore(os.path.join(self.home, "keys")).load_or_create()
+        self.trust = TrustStore(os.path.join(self.home, "trust"), policy=trust_policy)
+        self._pub_cache: Dict[str, Dict[str, str]] = {}
+
         self._load_or_register(auto_register)
 
         # 审计链放在 <home>/logs 下，与身份文件同级。
@@ -177,21 +210,54 @@ class AgentLink:
                     self.agent_id, self.token = d["agent_id"], d["token"]
                     self.name = d.get("name", self.name)
                     self._cursor = int(d.get("cursor", 0))
+                    self._ensure_published()
                     return
             except (OSError, ValueError, KeyError):
                 pass
         if not auto_register:
             raise LinkError("no_identity", "本地没有身份文件，且未开启自动注册")
+        pub = self.keys.public_bundle()
         out = self._api("POST", "/v1/agents/register", {
             "name": self.name, "capabilities": self.capabilities,
             "description": self.description, "invite_code": self.invite_code,
+            "sign_pub": pub["sign_pub"], "kex_pub": pub["kex_pub"],
         }, auth=False)
         self.agent_id, self.token = out["agent_id"], out["token"]
         self.name = out.get("name", self.name)
         self._save_identity()
         if not os.environ.get("A2ALINK_QUIET"):
             print(f"[a2alink] 已注册身份 {self.name} ({self.agent_id})")
-            print(f"[a2alink] 身份文件: {self._id_path}（含 token，权限 600，请勿提交仓库）")
+            print(f"[a2alink] 签名公钥指纹: {pub['fingerprint']}")
+            print(f"[a2alink] 私钥文件: {self.keys.root}（权限 600，请勿提交仓库）")
+
+    def _ensure_published(self) -> None:
+        """本地已有身份但要确认公钥已登记到注册中心。
+
+        用本地公钥和注册中心记录做比对：不一致说明要么本地换过钥匙
+        却没上传，要么服务器上的记录被人动过。两种情况都要说出来，
+        而不是静默地把公钥重传一遍——重传会把"被人改过"这件事擦掉。
+        """
+        try:
+            me = self._api("GET", f"/v1/agents/{self.agent_id}")
+        except LinkError:
+            return                      # 服务端不可达时不在构造阶段报错
+        remote = me.get("sign_pub") or ""
+        local = self.keys.signing.public_b64
+        if not remote:
+            self._publish_keys(reason="首次上传（本地身份早于公钥机制）")
+        elif remote != local:
+            if not os.environ.get("A2ALINK_QUIET"):
+                print(f"[a2alink] ⚠️ 注册中心记录的签名公钥与本地不一致。\n"
+                      f"          本地: {fingerprint_of(self.keys.signing.public_bytes)}\n"
+                      f"          远端记录已变更。若这是你自己轮换过密钥，"
+                      f"请执行 a2alink keys publish；否则可能有人在动你的登记信息。")
+
+    def _publish_keys(self, reason: str = "") -> Dict[str, Any]:
+        """把本机公钥登记到注册中心。只发公钥，不发私钥。"""
+        pub = self.keys.public_bundle()
+        return self._api("PUT", "/v1/agents/me/keys", {
+            "sign_pub": pub["sign_pub"], "kex_pub": pub["kex_pub"],
+            "reason": reason})
 
     def _save_identity(self) -> None:
         os.makedirs(self.home, exist_ok=True)
@@ -256,6 +322,73 @@ class AgentLink:
             if a["name"] == who:
                 return a["agent_id"]
         raise LinkError("not_found", f"找不到名为 {who!r} 的 Agent")
+
+    # ------------------------------------------------------------------
+    # 公钥
+    # ------------------------------------------------------------------
+    def peer_public(self, peer: str, refresh: bool = False) -> Dict[str, str]:
+        """取对端公钥。**本地固定优先于注册中心**。
+
+        这个优先级不能反：注册中心是可以被攻陷、被运营方改、被中间人劫持的，
+        而本地 pin 只有在"你亲手改过"之后才会变。发加密消息时拿错公钥的
+        后果是把内容加密给了攻击者，而且全程没有任何报错——这是最危险的一类失败。
+        """
+        if not refresh:
+            kex = self.trust.known_kex_pub(peer)
+            if kex:
+                return {"kex_pub": _b64e(kex), "source": "pinned"}
+            if peer in self._pub_cache:
+                return self._pub_cache[peer]
+        try:
+            a = self._api("GET", f"/v1/agents/{peer}")
+        except LinkError:
+            return {}
+        d = {"sign_pub": a.get("sign_pub", ""), "kex_pub": a.get("kex_pub", ""),
+             "key_fp": a.get("key_fp", ""), "source": "registry"}
+        self._pub_cache[peer] = d
+        return d
+
+    def _seal_and_sign(self, env: Envelope, peer: str, is_group: bool,
+                       trace: str) -> Tuple[bool, str]:
+        """给信封加密 + 签名。返回 (是否加密, 密钥来源)。
+
+        顺序：先加密再签名。反过来的话签名不覆盖密文，攻击者可以
+        把密文换成自己的而签名仍然有效。
+        """
+        encrypted, src = False, "none"
+        if not is_group and self.encrypt != "never":
+            kex = self.trust.known_kex_pub(peer)
+            src = "pinned"
+            if kex is None:
+                info = self.peer_public(peer)
+                kb = info.get("kex_pub")
+                if kb:
+                    if self.trust.policy == "strict":
+                        raise LinkError(
+                            "unpinned_peer_key",
+                            f"strict 信任策略下不接受注册中心下发的公钥（{peer}）。"
+                            "请先用 a2alink keys pin 导入并核对指纹。")
+                    try:
+                        kex = b64d(kb)
+                    except CryptoError:
+                        kex = None
+                    src = "registry"
+            if kex:
+                env.seal_payload(kex)
+                encrypted = True
+            elif self.encrypt == "always":
+                raise LinkError(
+                    "no_peer_key",
+                    f"encrypt=always 但拿不到 {peer} 的交换公钥，拒绝发送明文。"
+                    "可以等对方上线后重试，或把 encrypt 改成 auto。")
+        env.sign(self.keys)
+        self._audit("crypto.seal", "allow" if encrypted else "note",
+                    "crypto.sealed" if encrypted else (
+                        "crypto.group_plaintext" if is_group else "crypto.plaintext"),
+                    trace, detail={"peer": peer, "kex_source": src,
+                                   "encrypted": encrypted, "is_group": is_group,
+                                   "my_fp": self.keys.signing.fingerprint})
+        return encrypted, src
 
     def friend_request(self, who: str, message: str = "") -> Dict[str, Any]:
         return self._api("POST", "/v1/friends/requests",
@@ -453,7 +586,13 @@ class AgentLink:
             self._audit("gate.watchdog", "allow", "watchdog.allow", trace,
                         detail=wdet, evidence=fp)
 
-        # ---------- 4) 真正出网 ----------
+        # ---------- 4) 加密 + 签名 ----------
+        # 放在看门狗**之后**：加密后 payload 只剩占位符，看门狗的内容指纹
+        # 就失效了（"两个 Agent 互相发乱码"也会被当成不同内容放行）。
+        plain = dict(clean_payload)
+        encrypted, kex_src = self._seal_and_sign(env, peer, is_group, trace)
+
+        # ---------- 5) 真正出网 ----------
         try:
             out = self._api("POST", "/v1/messages", {"envelope": env.to_dict()})
         except LinkError as e:
@@ -471,7 +610,8 @@ class AgentLink:
                             "hops": env.ttl_hops}, evidence=fp)
         return Sent(env=env, delivered_to=out.get("delivered_to", 0),
                     duplicate=dup, egress=egress,
-                    verdict=verdict, seq=out.get("seq", 0))
+                    verdict=verdict, seq=out.get("seq", 0),
+                    plaintext=plain, encrypted=encrypted, kex_source=kex_src)
 
     def send_text(self, to: str, text: str, act: str = ACT_TASK,
                   stage: str = "open", **kw: Any) -> Sent:
@@ -551,6 +691,11 @@ class AgentLink:
             self._audit("gate.watchdog", "allow", "watchdog.allow", trace,
                         detail=wdet, evidence=fp)
 
+        # 回信同样要加密 + 签名。跳过这一步等于给攻击者留了个后门：
+        # "首发消息很规矩，但所有回复都是明文的"。
+        plain = dict(clean)
+        encrypted, kex_src = self._seal_and_sign(child, child.to_id, False, trace)
+
         try:
             out = self._api("POST", "/v1/messages", {"envelope": child.to_dict()})
         except LinkError as e:
@@ -563,7 +708,8 @@ class AgentLink:
                             "delivered_to": out.get("delivered_to", 0),
                             "hops": child.ttl_hops}, evidence=fp)
         return Sent(env=child, delivered_to=out.get("delivered_to", 0),
-                    egress=egress, verdict=verdict, seq=out.get("seq", 0))
+                    egress=egress, verdict=verdict, seq=out.get("seq", 0),
+                    plaintext=plain, encrypted=encrypted, kex_source=kex_src)
 
     # ------------------------------------------------------------------
     # 数据面：接收（内置入站闸门 + 看门狗）
@@ -587,6 +733,83 @@ class AgentLink:
                 self._cursor = max(self._cursor, seq)
                 continue
 
+            # ---------- 1) 验签：不过就不许进上下文 ----------
+            # 顺序不能调：先解密再验签，等于让未认证的密文先消耗一次
+            # 椭圆曲线运算（可被用来做 CPU 耗尽），而且解密结果一旦
+            # 因为后续验签失败被丢掉，它其实已经进过内存了。
+            if not env.signature and not self.require_signature:
+                # 显式关闭签名的降级路径。会持续在审计里刷 note，
+                # 目的是让"我们关掉了签名校验"这件事无法被忘掉。
+                authenticated = False
+                info = {"sign_pub": b"", "kex_pub": b""}
+                td = {"decision": "skipped", "fp": "",
+                      "detail": "require_signature=False，未签名消息被放行"}
+                self._audit("crypto.verify", "note", "crypto.signature_skipped",
+                            trace_hint,
+                            detail={"seq": seq, "from": env.from_agent})
+            else:
+                try:
+                    info = env.verify()
+                    authenticated = True
+                except (SignatureError, KeyMismatchError, CryptoError) as e:
+                    kind = "signature" if isinstance(e, SignatureError) else "key"
+                    self._audit("wire.recv", "deny", "wire.bad_signature", trace_hint,
+                                detail={"seq": seq, "from": env.from_agent[:64],
+                                        "kind": type(e).__name__,
+                                        "err": str(e)[:120]})
+                    out.append(Received(env=env, seq=seq, text="", quarantine=True,
+                                        authenticated=False,
+                                        reject_reason=f"签名无效：{e}"))
+                    self._cursor = max(self._cursor, seq)
+                    continue
+
+                # ---------- 2) 公钥固定：这把钥匙真的属于这个 agent 吗 ----------
+                td = self.trust.check(env.from_agent, info["sign_pub"],
+                                      info["kex_pub"] or None)
+                decision = td["decision"]
+                if decision in (MISMATCH, UNKNOWN):
+                    self.trust.record_mismatch(env.from_agent, td["fp"], "rejected")
+                    self._audit("crypto.trust", "deny", "crypto.key_changed", trace_hint,
+                                detail={"seq": seq, "from": env.from_agent,
+                                        "decision": decision, "fp": td["fp"],
+                                        "old_fp": td.get("old_fp", "")})
+                    out.append(Received(env=env, seq=seq, text="", quarantine=True,
+                                        authenticated=True, trust=td,
+                                        reject_reason=f"公钥不可信（{decision}）：{td['detail']}"))
+                    self._cursor = max(self._cursor, seq)
+                    continue
+                if decision == NEW:
+                    # 首次见到这个对端。放行，但要让运维知道"这个信任是自动建立的"。
+                    self._audit("crypto.trust", "note", "crypto.pin_new", trace_hint,
+                                detail={"seq": seq, "from": env.from_agent,
+                                        "fp": td["fp"], "kex_fp": td.get("kex_fp", ""),
+                                        "note": "TOFU 首次记录，指纹未带外核对"})
+
+            # ---------- 3) 解密 ----------
+            decrypted = False
+            if env.is_encrypted():
+                try:
+                    env.payload = env.open_payload(self.keys.kex)
+                    decrypted = True
+                    self._audit("crypto.open", "allow", "crypto.opened", trace_hint,
+                                detail={"seq": seq, "from": env.from_agent})
+                except (DecryptionError, CryptoError) as e:
+                    self._audit("crypto.open", "deny", "crypto.decrypt_failed",
+                                trace_hint,
+                                detail={"seq": seq, "from": env.from_agent,
+                                        "err": type(e).__name__})
+                    out.append(Received(env=env, seq=seq, text="", quarantine=True,
+                                        authenticated=True, trust=td,
+                                        reject_reason=f"解密失败：{e}"))
+                    self._cursor = max(self._cursor, seq)
+                    continue
+            elif self.encrypt in ("auto", "always"):
+                # 对端发了明文。这不是错误（对方可能没登记公钥），
+                # 但必须留痕——"这段对话里哪几条是明文"是事后要回答的问题。
+                self._audit("crypto.open", "note", "crypto.plaintext_inbound",
+                            trace_hint,
+                            detail={"seq": seq, "from": env.from_agent})
+
             verdict = self.wd.check_inbound(env)
             if verdict.action == STOP:
                 self._audit("gate.watchdog", "deny", "watchdog.deny", env.trace_id,
@@ -594,7 +817,9 @@ class AgentLink:
                                     "from": env.from_agent,
                                     "reasons": verdict.reasons[:4]})
                 out.append(Received(env=env, seq=seq, verdict=verdict,
-                                    text="", quarantine=False))
+                                    text="", quarantine=False,
+                                    authenticated=authenticated,
+                                    decrypted=decrypted, trust=td))
                 self._cursor = max(self._cursor, seq)
                 continue
 
@@ -617,7 +842,9 @@ class AgentLink:
                             preview=env.payload_text())
             out.append(Received(env=env, seq=seq, ingress=ing, verdict=verdict,
                                 text=fenced if ing.ok else "",
-                                quarantine=not ing.ok))
+                                quarantine=not ing.ok,
+                                authenticated=authenticated,
+                                decrypted=decrypted, trust=td))
             self._cursor = max(self._cursor, seq)
 
         if auto_ack and self._cursor:

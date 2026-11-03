@@ -171,7 +171,8 @@ class RegistryError(Exception):
 class Registry:
     def __init__(self, db_path: str = "a2alink.sqlite3",
                  invite_code: Optional[str] = None,
-                 audit_enabled: bool = True) -> None:
+                 audit_enabled: bool = True,
+                 require_signature: bool = True) -> None:
         self.db_path = db_path
         d = os.path.dirname(os.path.abspath(db_path))
         if d:
@@ -186,6 +187,9 @@ class Registry:
         self.lock = threading.RLock()
         self._migrate()
         self.invite_code = invite_code
+        # 默认要求签名。老部署要平滑迁移可临时设 False，
+        # 但那样等于放弃"服务端这一层防冒充"，不是长期选项。
+        self.require_signature = bool(require_signature)
         self._rl: Dict[str, List[float]] = {}
         # 服务端审计也落一条哈希链。为什么不只靠 SQLite：
         # 数据库是"可 UPDATE、可 DELETE"的东西，一句 UPDATE audit SET detail=...
@@ -212,6 +216,12 @@ class Registry:
         ("audit", "decision", "TEXT DEFAULT 'note'"),
         ("audit", "reason", "TEXT DEFAULT ''"),
         ("audit", "trace", "TEXT DEFAULT ''"),
+        # v0.2.0 公钥：注册中心只存公钥，私钥永远不出客户端。
+        # 有了这两列，注册中心再也不能冒充任何 Agent 发消息——它没有私钥。
+        ("agents", "sign_pub", "TEXT DEFAULT ''"),
+        ("agents", "kex_pub", "TEXT DEFAULT ''"),
+        ("agents", "key_fp", "TEXT DEFAULT ''"),
+        ("agents", "key_rotated_at", "REAL"),
     )
 
     def _migrate(self) -> None:
@@ -274,7 +284,8 @@ class Registry:
     # ------------------------------------------------------------------
     def register(self, name: str, capabilities: List[str], owner: str = "",
                  description: str = "", endpoint: str = "",
-                 invite_code: Optional[str] = None) -> Dict[str, Any]:
+                 invite_code: Optional[str] = None,
+                 sign_pub: str = "", kex_pub: str = "") -> Dict[str, Any]:
         if self.invite_code and not hmac.compare_digest(
                 str(invite_code or ""), self.invite_code):
             raise RegistryError("invite_required", "注册需要有效邀请码", 403)
@@ -283,6 +294,7 @@ class Registry:
         caps = [c.strip() for c in (capabilities or []) if c and c.strip()][:20]
         if len(json.dumps(caps, ensure_ascii=False)) > 2000:
             raise RegistryError("caps_too_large", "能力标签过长")
+        sign_pub, kex_pub, key_fp = self._check_pubkeys(sign_pub, kex_pub)
         now = time.time()
         agent_id = new_id("agt-")
         token = "a2a_" + secrets.token_urlsafe(32)
@@ -290,15 +302,58 @@ class Registry:
             if self._q("SELECT 1 FROM agents WHERE name=?", (name,)):
                 raise RegistryError("name_taken", "名称已被占用，请换一个", 409)
             self._x("""INSERT INTO agents(id,name,owner,description,capabilities,
-                       endpoint,token_hash,status,created_at,last_seen)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                       endpoint,token_hash,status,created_at,last_seen,
+                       sign_pub,kex_pub,key_fp)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (agent_id, name, owner[:120], description[:500],
                      json.dumps(caps, ensure_ascii=False), endpoint[:300],
-                     self._hash(token), "active", now, now))
-        self.audit(agent_id, "register", f"name={name}")
+                     self._hash(token), "active", now, now,
+                     sign_pub, kex_pub, key_fp))
+        self.audit(agent_id, "register", f"name={name}",
+                   extra={"has_sign_pub": bool(sign_pub), "key_fp": key_fp})
         return {"agent_id": agent_id, "name": name, "token": token,
-                "capabilities": caps,
+                "capabilities": caps, "key_fp": key_fp,
                 "note": "token 只返回这一次，请立刻保存到本地，不要提交到代码仓库"}
+
+    @staticmethod
+    def _check_pubkeys(sign_pub: str, kex_pub: str) -> Tuple[str, str, str]:
+        """校验并规范化公钥。公钥是公开信息，但仍然要验格式——
+        一个畸形公钥会让所有验签都失败，等到那时候再查就晚了。"""
+        from .crypto import CryptoError, b64d, fingerprint_of
+        sign_pub = (sign_pub or "").strip()[:200]
+        kex_pub = (kex_pub or "").strip()[:200]
+        if not sign_pub:
+            return "", "", ""
+        try:
+            sb = b64d(sign_pub)
+            kb = b64d(kex_pub) if kex_pub else b""
+        except CryptoError as e:
+            raise RegistryError("bad_pubkey", f"公钥不是合法 base64: {e}") from e
+        if len(sb) != 32:
+            raise RegistryError("bad_pubkey", "签名公钥必须是 32 字节（Ed25519）")
+        if kb and len(kb) != 32:
+            raise RegistryError("bad_pubkey", "交换公钥必须是 32 字节（X25519）")
+        return sign_pub, kex_pub, fingerprint_of(sb)
+
+    def set_keys(self, me: str, sign_pub: str, kex_pub: str,
+                 reason: str = "") -> Dict[str, Any]:
+        """轮换公钥。**旧公钥不保留**，但变更记进审计——
+        对端会因为指纹变化而拒绝，直到它们带外确认后重新 pin。"""
+        sign_pub, kex_pub, fp = self._check_pubkeys(sign_pub, kex_pub)
+        if not sign_pub:
+            raise RegistryError("bad_pubkey", "必须提供签名公钥")
+        rows = self._q("SELECT key_fp FROM agents WHERE id=?", (me,))
+        if not rows:
+            raise RegistryError("not_found", "Agent 不存在", 404)
+        old_fp = rows[0]["key_fp"] or ""
+        self._x("UPDATE agents SET sign_pub=?, kex_pub=?, key_fp=?, key_rotated_at=? "
+                "WHERE id=?", (sign_pub, kex_pub, fp, time.time(), me))
+        self.audit(me, "key_rotate", f"old={old_fp} new={fp}",
+                   extra={"old_fp": old_fp, "new_fp": fp, "reason": reason[:120]},
+                   trace="")
+        return {"key_fp": fp, "old_fp": old_fp,
+                "warning": "对端会因为你换了公钥而拒绝消息，"
+                           "需要它们带外确认后用 a2alink keys repin 更新"}
 
     def auth(self, token: Optional[str]) -> sqlite3.Row:
         if not token:
@@ -315,11 +370,17 @@ class Registry:
         self._x("UPDATE agents SET last_seen=? WHERE id=?", (time.time(), agent_id))
 
     def public_agent(self, row: sqlite3.Row) -> Dict[str, Any]:
-        """对外只暴露发现所需字段。token_hash / owner 绝不外泄。"""
+        """对外只暴露发现所需字段。token_hash / owner 绝不外泄。
+
+        公钥是公开信息，可以给——给别人发加密消息需要它。
+        """
         return {"agent_id": row["id"], "name": row["name"],
                 "description": row["description"],
                 "capabilities": json.loads(row["capabilities"] or "[]"),
-                "last_seen": row["last_seen"]}
+                "last_seen": row["last_seen"],
+                "sign_pub": row["sign_pub"] if "sign_pub" in row.keys() else "",
+                "kex_pub": row["kex_pub"] if "kex_pub" in row.keys() else "",
+                "key_fp": row["key_fp"] if "key_fp" in row.keys() else ""}
 
     def discover(self, capability: Optional[str], q: Optional[str],
                  limit: int = 50) -> List[Dict[str, Any]]:
@@ -857,9 +918,61 @@ class Registry:
     # ------------------------------------------------------------------
     # 数据面：消息准入 + 投递
     # ------------------------------------------------------------------
+    def _verify_envelope(self, me: str, env: Envelope) -> None:
+        """用注册库里登记的公钥验证信封签名。
+
+        为什么服务端也要验：接收方虽然有公钥固定能挡住冒充，但如果服务端
+        先挡一层，攻击者连"把冒充消息投递出去"这一步都做不到，也就不会在
+        接收方那里刷出一堆告警。而且对于没有做 pin 的接收方（开发环境），
+        这是唯一的防线。
+        """
+        from .crypto import CryptoError, b64d
+        from .protocol import Envelope as _Env
+
+        rows = self._q("SELECT sign_pub, key_fp, name FROM agents WHERE id=?", (me,))
+        if not rows:
+            raise RegistryError("not_found", "发送者不存在", 404)
+        stored = rows[0]["sign_pub"] or ""
+
+        if not stored:
+            # 老身份（0.1.x 注册的）没有公钥。此时不能硬拒，否则所有存量
+            # 身份一夜之间全部失效；但必须留痕，让运维看得见"还有谁没交公钥"。
+            if self.require_signature:
+                raise RegistryError(
+                    "unsigned_rejected",
+                    "本注册中心要求签名消息，但你的身份没有登记公钥。"
+                    "请用 a2alink keys publish 上传公钥后重试。", 403)
+            self.audit(me, "send_unsigned", "消息未签名（该身份未登记公钥）",
+                       extra={"msg_id": env.id}, trace=env.trace_id or "")
+            return
+
+        if not env.signature or not isinstance(env.pub, dict):
+            raise RegistryError("unsigned_rejected",
+                                "本注册中心要求签名消息，该信封没有签名", 403)
+        if env.pub.get("sign") != stored:
+            raise RegistryError(
+                "key_mismatch",
+                "信封里的公钥与注册记录不一致。要么你在用旧密钥发消息，"
+                "要么这是有人冒用你的身份。", 403)
+        try:
+            sig = b64d(env.signature)
+            pub = b64d(stored)
+        except CryptoError as e:
+            raise RegistryError("bad_signature", f"签名或公钥编码非法: {e}") from e
+        from .crypto import Ed25519KeyPair
+        if not Ed25519KeyPair.verify(pub, _Env.SIG_DOMAIN + env.canonical_bytes(), sig):
+            raise RegistryError(
+                "bad_signature",
+                "签名校验失败：信封内容被改动过，或者发送者没有对应私钥。", 403)
+
     def send(self, me: str, env: Envelope) -> Dict[str, Any]:
         if env.from_agent != me:
             raise RegistryError("forbidden", "信封 from 与登录身份不一致（疑似冒名）", 403)
+
+        # ---------- 验签：注册中心的第一道守门责任 ----------
+        # 这里用**库里存的公钥**验，而不是信封里带的那把。
+        # 用信封自带的公钥验签等于没验——攻击者当然能签一份与自己公钥自洽的东西。
+        self._verify_envelope(me, env)
 
         if env.to_type == "agent":
             if self._friend_state(me, env.to_id) != "accepted":
@@ -1057,6 +1170,7 @@ class _Handler(BaseHTTPRequestHandler):
         ("GET", r"^/healthz$", "h_health"),
         ("GET", r"^/v1/stats$", "h_stats"),
         ("POST", r"^/v1/agents/register$", "h_register"),
+        ("PUT", r"^/v1/agents/me/keys$", "h_my_keys"),
         ("GET", r"^/v1/agents$", "h_discover"),
         ("GET", r"^/v1/agents/(?P<aid>[A-Za-z0-9\-_]+)$", "h_agent"),
         ("POST", r"^/v1/friends/requests$", "h_friend_req"),
@@ -1088,6 +1202,12 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:  # noqa: N802
         self._dispatch("DELETE")
+
+    def do_PUT(self) -> None:  # noqa: N802
+        # 只用于轮换公钥（PUT /v1/agents/me/keys）。
+        # 语义上必须是 PUT 而不是 POST：同一个请求重放多次，结果应当一致——
+        # 换公钥是幂等操作，而 POST 会让人以为"发两次会换两次"。
+        self._dispatch("PUT")
 
     def _dispatch(self, method: str) -> None:
         parsed = urlparse(self.path)
@@ -1131,8 +1251,17 @@ class _Handler(BaseHTTPRequestHandler):
             owner=str(d.get("owner", ""))[:120],
             description=str(d.get("description", ""))[:500],
             endpoint=str(d.get("endpoint", ""))[:300],
-            invite_code=d.get("invite_code"))
+            invite_code=d.get("invite_code"),
+            sign_pub=str(d.get("sign_pub", "")),
+            kex_pub=str(d.get("kex_pub", "")))
         self._send(201, out)
+
+    def h_my_keys(self, a, q) -> None:
+        me = self._me()
+        d = self._body()
+        self._send(200, self.registry.set_keys(
+            me["id"], str(d.get("sign_pub", "")), str(d.get("kex_pub", "")),
+            reason=str(d.get("reason", ""))))
 
     def h_discover(self, a, q) -> None:
         self._send(200, {"agents": self.registry.discover(
