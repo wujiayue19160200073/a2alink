@@ -54,11 +54,20 @@ def _client(args: argparse.Namespace, **kw: Any) -> AgentLink:
 
 # ==========================================================================
 def cmd_registry(args: argparse.Namespace) -> int:
-    reg = Registry(args.db, invite_code=args.invite_code)
-    if args.host not in ("127.0.0.1", "localhost"):
+    local = args.host in ("127.0.0.1", "localhost", "::1")
+    mesh = bool(getattr(args, "local_mesh", False)) and local
+    if getattr(args, "local_mesh", False) and not local:
+        # 静默降级比报错更危险：用户以为开了同机互信，其实没开（或反过来）。
+        print("⚠️  --local-mesh 只在监听回环地址时生效；本机将对外提供注册服务，"
+              "已强制关闭同机互信。", file=sys.stderr)
+    reg = Registry(args.db, invite_code=args.invite_code, local_mesh=mesh)
+    if not local:
         print("⚠️  警告：注册中心将监听非回环地址。任何能访问该端口的人都可以注册身份、"
               "尝试加好友。\n    公网部署前请务必设置 --invite-code，并在前面加 TLS 反代。",
               file=sys.stderr)
+    if mesh:
+        print("[a2alink] 同机互信已开启（local_mesh）：本机会话互发消息免好友审批，"
+              "每次放行都会写入审计。", file=sys.stderr)
     serve(reg, host=args.host, port=args.port, verbose=args.verbose)
     return 0
 
@@ -731,6 +740,606 @@ def cmd_pending(args: argparse.Namespace) -> int:
 
 
 # ==========================================================================
+# v0.3：会话身份 / 一键安装 / 跨对话收发
+# ==========================================================================
+def _ident(args: argparse.Namespace):
+    """解析当前会话身份。仅在 --as 与"猜"的情况下多说一句。"""
+    from . import sessions
+    who = getattr(args, "as_", None)
+    ident = sessions.current(who=who)
+    if ident.source == "latest" and not who:
+        # 猜了就必须说。静默地"用了最近那个会话"是最容易发错人的场景。
+        print(f"[a2alink] 未检测到会话 ID，按最近活跃的会话处理：{ident.display}"
+              f"（如不对，用 --as <名字> 指定）", file=sys.stderr)
+    elif ident.source == "fallback":
+        print(f"[a2alink] 未检测到会话 ID，已创建独立身份 {ident.display}"
+              f"（{ident.agent_name}）", file=sys.stderr)
+    return ident
+
+
+def _session_client(args: argparse.Namespace, **kw: Any):
+    """会话身份 + 自动中继，一步到位。
+
+    这是"一键"的全部秘密：调用方不需要先起服务、先注册、先加好友。
+    """
+    from . import autostart
+    ident = _ident(args)
+    res = autostart.ensure(args.registry, quiet=True,
+                           local_mesh=kw.pop("local_mesh", True))
+    if res.get("managed") and not res.get("alive", True):
+        raise SystemExit(f"本地中继不可用：{args.registry}")
+    caps: List[str] = []
+    for g in (args.cap or []):
+        caps.extend([c.strip() for c in str(g).split(",") if c.strip()])
+    # 注册时的三行提示（身份、指纹、私钥路径）对第一次用的人有用，对
+    # 第 20 次调用就是噪音，还会把 check 的摘要冲散。这里自己控制：
+    # 只有新建身份时打一行到 stderr，其余一律安静。
+    fresh = not os.path.exists(os.path.join(ident.home, "identity.json"))
+    old_quiet = os.environ.get("A2ALINK_QUIET")
+    os.environ["A2ALINK_QUIET"] = "1"
+    try:
+        c = AgentLink(registry=args.registry, name=ident.agent_name,
+                      capabilities=caps, home=ident.home,
+                      peer_scope=args.scope, **kw)
+    finally:
+        if old_quiet is None:
+            os.environ.pop("A2ALINK_QUIET", None)
+        else:
+            os.environ["A2ALINK_QUIET"] = old_quiet
+    if fresh:
+        print(f"[a2alink] {ident.display} 首次上线：{c.agent_id}"
+              f"  私钥 {c.keys.root}（勿提交仓库）", file=sys.stderr)
+    return c, ident
+
+
+def _rel(ts: float) -> str:
+    d = max(0.0, time.time() - float(ts or 0))
+    if d < 60:
+        return "刚刚"
+    if d < 3600:
+        return f"{int(d // 60)} 分钟前"
+    if d < 86400:
+        return f"{int(d // 3600)} 小时前"
+    return f"{int(d // 86400)} 天前"
+
+
+def _name_map(c: AgentLink, limit: int = 500) -> Dict[str, str]:
+    """agent_id → 给人看的名字。
+
+    注册中心只知道 ``s-3f2a1b44``，别名只在本机 sessions.json 里。两边拼起来
+    才是用户认得的那个称呼；只查一边的结果是"来消息了，来自 s-3f2a1b44"，
+    等于没说。
+    """
+    from . import sessions
+    try:
+        rows = c.discover(None, None, limit)
+    except Exception:
+        rows = []
+    id2name = {str(a.get("agent_id")): str(a.get("name") or "")
+               for a in rows if a.get("agent_id")}
+    try:
+        label_of = {str(r.get("agent_name")): str(r.get("label"))
+                    for r in sessions.SessionStore().all().values()
+                    if r.get("label")}
+    except (OSError, ValueError):
+        label_of = {}
+    out: Dict[str, str] = {}
+    for aid, name in id2name.items():
+        lbl = label_of.get(name)
+        out[aid] = f"@{lbl}（{name}）" if lbl else name
+    return out
+
+
+def _body_of(r: Any) -> str:
+    """从载荷里取人要看的那句话。
+
+    直接打印 ``r.text`` 会把 ``instruction``/``intent`` 这些键名和整段围栏
+    声明一起喷出来，人读着累，Agent 也会把键名当正文。取正文、单独包围栏，
+    既保留防护标记又不妨碍阅读。
+    """
+    p = r.env.payload if isinstance(getattr(r.env, "payload", None), dict) else {}
+    for k in ("instruction", "text", "message", "content", "question"):
+        v = p.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    if not p:
+        return ""
+    return json.dumps(p, ensure_ascii=False)[:2000]
+
+
+def _recent_path(home: str) -> str:
+    return os.path.join(home, "recent.json")
+
+
+def _remember(home: str, items: List[Any], cap: int = 200) -> None:
+    """记下"这条消息是谁发的"，供 reply 用。
+
+    只存元数据 + 截断后的内容摘要，不存全文——本地缓存不该变成第二个
+    明文消息库，那是把加密和"日志不存原文"的努力绕过去了。
+    """
+    p = _recent_path(home)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+        if not isinstance(cache, dict):
+            cache = {}
+    except (OSError, ValueError):
+        cache = {}
+    for r in items:
+        if not r.env or not r.env.id:
+            continue
+        cache[r.env.id] = {
+            "from": r.env.from_agent,
+            "conversation_id": r.env.conversation_id,
+            "act": r.env.act,
+            "ts": r.env.created_at if hasattr(r.env, "created_at") else time.time(),
+            "preview": (r.text or "")[:80],
+        }
+    if len(cache) > cap:
+        for k in sorted(cache, key=lambda k: float(cache[k].get("ts") or 0))[:len(cache) - cap]:
+            cache.pop(k, None)
+    try:
+        os.makedirs(home, exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+        os.chmod(p, 0o600)
+    except OSError:
+        pass
+
+
+def _lookup(home: str, msg_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(_recent_path(home), "r", encoding="utf-8") as f:
+            return json.load(f).get(msg_id)
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _resolve_target(to: str) -> str:
+    """把 ``@运维`` 这类本机会话别名翻成协议里的 agent 名。
+
+    别名只在本机有意义，注册中心不知道"运维"是谁。**先查别名再交给协议**，
+    是因为用户说"给运维发"时，他想的是那个对话，不是某个远端同名 Agent。
+    查不到就原样传下去，让 client.resolve 按名字/ID 去注册中心找。
+    """
+    from . import sessions
+    t = str(to or "").strip()
+    bare = t[1:] if t.startswith("@") else t
+    if not bare:
+        return t
+    try:
+        rec = sessions.SessionStore().by_label(bare)
+    except (OSError, ValueError):
+        rec = None
+    return rec["agent_name"] if rec else bare
+
+
+def _print_received(items: List[Any], names: Dict[str, str]) -> None:
+    for r in items:
+        who = names.get(r.env.from_agent) or r.env.from_agent
+        bad = r.quarantine or bool(r.reject_reason)
+        tag = "🚫" if bad else "·"
+        print(f"  {tag} [{r.env.act}] {who}  id={r.env.id}")
+        if r.reject_reason:
+            print(f"      ⛔ 拒收：{r.reject_reason}")
+            continue
+        if r.quarantine:
+            print("      🚫 检出可疑指令，已隔离，内容不进入上下文"
+                  "（a2alink logs tail 可查判定依据）")
+            continue
+        body = _body_of(r) or "（空内容）"
+        # 围栏必须留着：这段文本就是要进 Agent 上下文的东西，
+        # 去掉标记等于把"这是外部数据"这个信息也去掉了。
+        print(f'      <untrusted_external_content source="agent:{r.env.from_agent}">')
+        for line in body.splitlines()[:12]:
+            print(f"      {line}")
+        print("      </untrusted_external_content>")
+
+
+# ---------------------------------------------------------------- session
+def cmd_session(args: argparse.Namespace) -> int:
+    from . import sessions
+    st = sessions.SessionStore()
+    action = args.action
+
+    if action == "whoami":
+        ident = _ident(args)
+        _p(ident.to_dict())
+        return 0
+
+    if action == "name":
+        ident = _ident(args)
+        try:
+            rec = st.bind(ident.sid, label=args.label)
+        except sessions.SessionError as e:
+            print(f"❌ {e}", file=sys.stderr)
+            return 2
+        # 起名顺手把身份登记到中继。不起这一步，别人 @ 你时会得到
+        # "找不到名为 s-xxxx 的 Agent"——名字存在本地，但注册中心不认识它。
+        # 起名 = 上线，这是用户的心理模型。
+        online = ""
+        try:
+            _c, _i = _session_client(args)
+            online = f"，已在 {args.registry} 上线"
+        except Exception as e:
+            online = f"，但上线失败（{e}）；下次收信时会自动补登记"
+        print(f"✅ 当前对话已命名为 @{rec['label']}"
+              f"（协议身份 {rec['agent_name']}，改名不会改变它）{online}")
+        print(f"   别人可以这样找你：a2alink say @{rec['label']} \"...\"")
+        return 0
+
+    if action == "release":
+        ok = st.release_label(args.label)
+        print(f"✅ 已释放别名 @{args.label}" if ok else f"（别名 @{args.label} 不存在）")
+        return 0 if ok else 1
+
+    if action == "list":
+        rows = st.all()
+        if not rows:
+            print("（本机还没有任何会话。在新对话里跑一次 a2alink check 就会自动登记。）")
+            return 0
+        cur = None
+        try:
+            cur = _ident(args).sid
+        except Exception:
+            pass
+        print(f"{'':2} {'别名':<12} {'协议身份':<16} {'最后活跃':<12} 会话 ID")
+        for sid, r in sorted(rows.items(), key=lambda kv: -float(kv[1].get("last_seen") or 0)):
+            mark = "→" if sid == cur else " "
+            print(f"{mark:2} {'@' + r['label'] if r.get('label') else '-':<12} "
+                  f"{r.get('agent_name', ''):<16} "
+                  f"{_rel(r.get('last_seen')):<12} {sid}")
+        return 0
+
+    if action == "forget":
+        ident = _ident(args)
+        target = args.who or ident.sid
+        sid = st.resolve(target)
+        if not sid:
+            print(f"❌ 找不到会话 {target!r}", file=sys.stderr)
+            return 2
+        if args.drop_files:
+            print("⚠️  同时删除身份目录：私钥和审计链会一起消失，之后无法再验证"
+                  "该身份发过的消息。", file=sys.stderr)
+            if not args.yes:
+                print("   确认请加 --yes。", file=sys.stderr)
+                return 2
+        ok = st.forget(sid, drop_files=args.drop_files)
+        print("✅ 已从会话表移除" if ok else "（没有这条记录）")
+        return 0 if ok else 1
+
+    print("未知动作", file=sys.stderr)
+    return 2
+
+
+# ------------------------------------------------------------------ skill
+def cmd_skill(args: argparse.Namespace) -> int:
+    from . import skillpack
+    root = args.dir or skillpack.default_skills_root()
+    try:
+        if args.action == "install":
+            out = skillpack.install(root, force=args.force, dry_run=args.dry_run)
+            if out.get("dry_run"):
+                print("（预演，未写盘）将写入：")
+                for p in out["would_write"]:
+                    print(f"  + {p}")
+                return 0
+            if out.get("upgraded_from") and out["upgraded_from"] != out["version"]:
+                print(f"✅ 已从 v{out['upgraded_from']} 升级到 v{out['version']}")
+            for line in skillpack.post_install_hint(out["target"]):
+                print(line)
+            return 0
+
+        if args.action == "status":
+            st = skillpack.status(root)
+            _p(st)
+            if st.get("installed") and st.get("outdated"):
+                print("\n提示：技能版本与当前库不一致，执行 a2alink skill install 更新。")
+            return 0 if st.get("installed") else 1
+
+        if args.action == "uninstall":
+            out = skillpack.uninstall(root, force=args.force)
+            if out["removed"]:
+                print(f"✅ 已删除 {out['target']}")
+                print("   身份、密钥、审计链仍在 ~/.a2alink 下，没有动。")
+                return 0
+            print(f"未删除：{out.get('reason')}"
+                  + (f"\n{out['hint']}" if out.get("hint") else ""))
+            return 1
+    except skillpack.SkillPackError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 2
+    return 2
+
+
+# --------------------------------------------------------------------- up
+def cmd_up(args: argparse.Namespace) -> int:
+    from . import autostart
+    try:
+        out = autostart.ensure(args.registry, quiet=False,
+                               local_mesh=not args.no_mesh)
+    except autostart.AutoStartError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 2
+    if not out.get("managed"):
+        print(f"远端注册中心：{'在线' if out.get('alive') else '不可达'}  {args.registry}")
+        return 0 if out.get("alive") else 3
+    if not out.get("started"):
+        print(f"✅ 本地中继已在运行 {args.registry}"
+              + (f"（pid {out['pid']}）" if out.get("pid") else ""))
+    return 0
+
+
+def cmd_down(args: argparse.Namespace) -> int:
+    from . import autostart
+    out = autostart.stop(args.registry)
+    if out.get("stopped"):
+        return 0
+    reason = out.get("reason")
+    if reason == "not_running":
+        print("（中继没在跑）")
+        return 0
+    if reason == "not_managed":
+        print("⚠️  该端口上的 a2alink 不是本工具拉起的，没有动它。", file=sys.stderr)
+        print(f"   {out.get('hint', '')}", file=sys.stderr)
+        return 1
+    if reason == "remote":
+        print("远端注册中心不归本机管。", file=sys.stderr)
+        return 1
+    print(f"停止失败：{reason}", file=sys.stderr)
+    return 1
+
+
+# -------------------------------------------------------------------- say
+def cmd_say(args: argparse.Namespace) -> int:
+    """发一条消息，不等回复。"""
+    try:
+        c, ident = _session_client(args)
+    except Exception as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 2
+    act = args.act or "event"
+    payload = {"instruction": args.text, "intent": "note"}
+    if args.json:
+        payload = json.loads(args.json)
+    try:
+        s = c.send(_resolve_target(args.to), payload, act=act, stage=args.stage,
+                   conversation_id=args.conversation,
+                   force=args.force, force_reason=args.reason)
+    except EgressBlocked as e:
+        print(f"🚫 出站被拦：{e.message}", file=sys.stderr)
+        _p(e.result.to_dict())
+        print("\n三选一：1) 改内容只给结论 2) 加白名单 3) "
+              "人已确认可发 → --force --reason \"为什么可以发\"", file=sys.stderr)
+        return 3
+    except LoopHalt as e:
+        print(f"⛔ {e.message}", file=sys.stderr)
+        return 4
+    except LinkError as e:
+        if e.code == "not_friends":
+            print("🚫 不是好友，且这个中继没开同机互信。\n"
+                  "   本机中继：a2alink up（默认开启 local_mesh）\n"
+                  "   跨机对端：先 a2alink friend request / accept", file=sys.stderr)
+            return 5
+        print(f"❌ {e.message}", file=sys.stderr)
+        return 2
+    print(f"✅ 已发送 → {args.to}  id={s.env.id}  conv={s.env.conversation_id}")
+    print(f"   署名 {ident.display}  对方下次收信时可见")
+    return 0
+
+
+# -------------------------------------------------------------------- ask
+def cmd_ask(args: argparse.Namespace) -> int:
+    """提问并等回答。等不到就如实说等不到，不重试。"""
+    try:
+        c, ident = _session_client(args)
+    except Exception as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 2
+    payload = {"instruction": args.text, "intent": "question", "need_reply": True}
+    try:
+        s = c.send(_resolve_target(args.to), payload, act="task", stage="open",
+                   conversation_id=args.conversation,
+                   force=args.force, force_reason=args.reason)
+    except EgressBlocked as e:
+        print(f"🚫 出站被拦：{e.message}", file=sys.stderr)
+        return 3
+    except LoopHalt as e:
+        print(f"⛔ {e.message}", file=sys.stderr)
+        return 4
+    except LinkError as e:
+        if e.code == "not_friends":
+            print("🚫 不是好友（且中继未开同机互信）。见 a2alink up 的说明。",
+                  file=sys.stderr)
+            return 5
+        print(f"❌ {e.message}", file=sys.stderr)
+        return 2
+
+    print(f"📤 已提问 → {args.to}  id={s.env.id}")
+    wait = float(args.wait or 0)
+    if wait <= 0:
+        print("   （--wait 0：已投递，不等待回答。对方下次收信时可见。）")
+        return 0
+
+    names = _name_map(c)
+    others: List[Any] = []
+    answer = None
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        left = deadline - time.monotonic()
+        try:
+            items = c.recv(wait=min(2.0, max(0.2, left)), limit=20)
+        except LinkError as e:
+            print(f"⚠️  收信出错：{e.message}", file=sys.stderr)
+            break
+        for r in items:
+            # 认"回复这条"最准；同一 conversation 里对方的后续消息也算回答，
+            # 因为对方可能用 say 而不是 reply（人手写命令时很常见）。
+            # 注意不能用 delivered_to 比 from_agent——那是投递份数，不是身份。
+            if r.env.in_reply_to == s.env.id or (
+                    r.env.conversation_id == s.env.conversation_id
+                    and r.env.from_agent != c.agent_id):
+                answer = r
+            else:
+                others.append(r)
+        if answer:
+            break
+
+    if others:
+        _remember(ident.home, others)
+        print(f"\n📥 期间还收到 {len(others)} 条其它消息：")
+        _print_received(others, names)
+
+    if not answer:
+        print(f"\n⏳ {wait:.0f} 秒内没有回答。消息已投递，对方被唤起收信时能看到。")
+        print("   不要循环重发同一个问题——这正是协议要防的死循环。")
+        return 6
+
+    _remember(ident.home, [answer])
+    who = names.get(answer.env.from_agent) or answer.env.from_agent
+    print(f"\n📥 收到回答 · 来自 {who} · id={answer.env.id}")
+    if answer.reject_reason:
+        print(f"   ⛔ 但这条被拒收了：{answer.reject_reason}")
+        return 7
+    body = _body_of(answer) or "（空）"
+    print(f'   <untrusted_external_content source="agent:{answer.env.from_agent}">')
+    for line in body.splitlines()[:20]:
+        print(f"   {line}")
+    print("   </untrusted_external_content>")
+    return 0
+
+
+# ------------------------------------------------------------------ reply
+def cmd_reply(args: argparse.Namespace) -> int:
+    """回复某条收到的消息。
+
+    必须带 in_reply_to 和 stage=done：一条问答链走完就结束，
+    不留下"还能继续聊"的余地。这是本协议和 IM 最本质的区别。
+    """
+    try:
+        c, ident = _session_client(args)
+    except Exception as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 2
+    meta = _lookup(ident.home, args.msg_id)
+    if not meta:
+        print(f"❌ 本地没有这条消息的记录（{args.msg_id}）。\n"
+              f"   可能不是这个会话收的，或已被清理。\n"
+              f"   可以直接发：a2alink say <对方> \"...\"", file=sys.stderr)
+        return 2
+    to = args.to or meta.get("from")
+    if not to:
+        print("❌ 不知道回复给谁，请用 --to 指定。", file=sys.stderr)
+        return 2
+    payload = {"instruction": args.text, "intent": "answer"}
+    try:
+        s = c.send(to, payload, act="result", stage="done",
+                   conversation_id=meta.get("conversation_id"),
+                   in_reply_to=args.msg_id)
+    except EgressBlocked as e:
+        print(f"🚫 出站被拦：{e.message}", file=sys.stderr)
+        return 3
+    except LoopHalt as e:
+        print(f"⛔ {e.message}", file=sys.stderr)
+        return 4
+    except LinkError as e:
+        print(f"❌ {e.message}", file=sys.stderr)
+        return 2
+    # meta 里记的是 agent_id，直接打出来是 agt-xxxx，人认不出是谁。
+    # 多花一次 discover 换一句人话，值。
+    shown = _name_map(c).get(to, to)
+    print(f"✅ 已回复 → {shown}  id={s.env.id}（这条链到此结束）")
+    return 0
+
+
+# ------------------------------------------------------------------ check
+def cmd_check(args: argparse.Namespace) -> int:
+    """收信 + 摘要。Agent 每次上手通信前都该先跑这一条。"""
+    try:
+        c, ident = _session_client(args)
+    except Exception as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 2
+    try:
+        items = c.recv(wait=args.wait, limit=args.limit)
+    except LinkError as e:
+        print(f"❌ 收信失败：{e.message}", file=sys.stderr)
+        return 2
+
+    names = _name_map(c)
+    head = f"📬 {ident.display}（{ident.agent_name}）"
+    if not items:
+        print(f"{head} 没有未读消息。")
+    else:
+        print(f"{head} 共 {len(items)} 条未读：")
+        _remember(ident.home, items)
+        for i, r in enumerate(items, 1):
+            who = names.get(r.env.from_agent) or r.env.from_agent
+            flag = "🚫" if (r.quarantine or r.reject_reason) else (
+                "❓" if r.env.act == "task" else "·")
+            body = "" if (r.quarantine or r.reject_reason) else _body_of(r)
+            print(f"\n{i}. {flag} [{r.env.act}] 来自 {who}  {_rel(r.env.created_at)}")
+            print(f"   id={r.env.id}")
+            if r.reject_reason:
+                print(f"   ⛔ 拒收：{r.reject_reason}")
+            elif r.quarantine:
+                print("   🚫 检出可疑指令，已隔离，内容不进入上下文")
+            else:
+                print(f'   <untrusted_external_content source="agent:{r.env.from_agent}">')
+                for line in body.splitlines()[:10] or ["（空内容）"]:
+                    print(f"   {line}")
+                print("   </untrusted_external_content>")
+            if r.env.act == "task":
+                print(f"   ↳ 这是提问，回话：a2alink reply {r.env.id} \"...\"")
+            else:
+                print(f"   ↳ 要回也可以：a2alink reply {r.env.id} \"...\"")
+
+    # 待办也要顺带说：邀请和投票不会自己冒出来。
+    try:
+        d = c.pending_actions()
+    except LinkError:
+        d = {"count": 0}
+    if d.get("count"):
+        print(f"\n📌 另有 {d['count']} 项待你表态（a2alink pending 查看）")
+    return 0
+
+
+# ------------------------------------------------------------------ peers
+def cmd_peers(args: argparse.Namespace) -> int:
+    """本机有哪些对话 + 中继上还有谁。"""
+    from . import sessions
+    try:
+        c, ident = _session_client(args)
+    except Exception as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 2
+    st = sessions.SessionStore()
+    local = st.all()
+
+    print(f"本机对话（{len(local)} 个）")
+    if not local:
+        print("  （还没有。在新对话里跑一次 a2alink check 就会自动登记。）")
+    for sid, r in sorted(local.items(), key=lambda kv: -float(kv[1].get("last_seen") or 0)):
+        mark = "→" if sid == ident.sid else " "
+        name = "@" + r["label"] if r.get("label") else "(未命名)"
+        print(f" {mark} {name:<12} {r.get('agent_name', ''):<16} "
+              f"最后活跃 {_rel(r.get('last_seen'))}")
+
+    ids = {r.get("agent_name") for r in local.values()}
+    try:
+        remotes = [a for a in c.discover(None, None, 200)
+                   if a.get("name") not in ids]
+    except LinkError:
+        remotes = []
+    if remotes:
+        print(f"\n中继上的其它 Agent（{len(remotes)} 个，不在本机会话表里）")
+        for a in remotes[:30]:
+            caps = ",".join(a.get("capabilities") or []) or "-"
+            print(f"  · {a['name']:<20} caps={caps}")
+    return 0
+
+
+# ==========================================================================
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="a2alink", description="A2A Link — AI Agent 对等通信（含防泄密闸门与死循环看门狗）")
@@ -742,13 +1351,94 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--home", default=None, help="身份文件目录，默认 ~/.a2alink/<name>")
     p.add_argument("--scope", default="wan", choices=["local", "lan", "wan"],
                    help="默认对端信任域（wan 最严，默认）")
+    p.add_argument("--as", dest="as_", default=None, metavar="别名",
+                   help="以指定会话身份执行（会话别名或会话 ID）")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    # ---------------- v0.3：会话 / 一键装 / 跨对话 ----------------
+    se = sub.add_parser("session", help="会话身份：我是谁 / 给对话起名 / 列本机对话")
+    ses = se.add_subparsers(dest="action", required=True)
+    ses.add_parser("whoami", help="当前对话的身份").set_defaults(func=cmd_session)
+    sname = ses.add_parser("name", help="给当前对话起名，之后别人可以 @这个名字")
+    sname.add_argument("label")
+    sname.set_defaults(func=cmd_session)
+    srel = ses.add_parser("release", help="释放一个别名")
+    srel.add_argument("label")
+    srel.set_defaults(func=cmd_session)
+    ses.add_parser("list", help="本机所有对话").set_defaults(func=cmd_session)
+    sfg = ses.add_parser("forget", help="从会话表移除（默认不删身份文件）")
+    sfg.add_argument("who", nargs="?", default=None)
+    sfg.add_argument("--drop-files", dest="drop_files", action="store_true",
+                     help="同时删除身份目录（私钥与审计链会一起消失）")
+    sfg.add_argument("--yes", action="store_true")
+    sfg.set_defaults(func=cmd_session)
+
+    sk = sub.add_parser("skill", help="装成 WorkBuddy/Claude 技能（一键安装）")
+    sks = sk.add_subparsers(dest="action", required=True)
+    ski = sks.add_parser("install", help="安装到 ~/.workbuddy/skills/a2alink")
+    ski.add_argument("--dir", default=None, help="技能根目录（默认 ~/.workbuddy/skills）")
+    ski.add_argument("--force", action="store_true", help="覆盖不是本工具装的同名目录")
+    ski.add_argument("--dry-run", dest="dry_run", action="store_true",
+                     help="只列要写哪些文件，不落盘")
+    ski.set_defaults(func=cmd_skill)
+    sst = sks.add_parser("status", help="装了没 / 版本对不对 / 源码还在不在")
+    sst.add_argument("--dir", default=None)
+    sst.set_defaults(func=cmd_skill)
+    sun = sks.add_parser("uninstall", help="卸载技能（不动身份与审计）")
+    sun.add_argument("--dir", default=None)
+    sun.add_argument("--force", action="store_true")
+    sun.set_defaults(func=cmd_skill)
+
+    u = sub.add_parser("up", help="确保本地中继在跑（不在就拉起来）")
+    u.add_argument("--no-mesh", dest="no_mesh", action="store_true",
+                   help="关闭同机会话互信（默认开启）")
+    u.set_defaults(func=cmd_up)
+    sub.add_parser("down", help="停掉本工具拉起的本地中继").set_defaults(func=cmd_down)
+
+    sy = sub.add_parser("say", help="给某个对话发消息（不等回复）")
+    sy.add_argument("to", help="会话别名(@运维)、agent 名或 agent_id")
+    sy.add_argument("text", nargs="?", default=None)
+    sy.add_argument("--json", default=None)
+    sy.add_argument("--act", default="event",
+                    choices=["event", "task", "result", "chat", "notice"])
+    sy.add_argument("--stage", default="open",
+                    choices=["open", "done", "handoff", "need_human", "blocked"])
+    sy.add_argument("--conversation", default=None)
+    sy.add_argument("--force", action="store_true")
+    sy.add_argument("--reason", default="")
+    sy.set_defaults(func=cmd_say)
+
+    aq = sub.add_parser("ask", help="提问并等回答（等不到就说等不到，不重试）")
+    aq.add_argument("to")
+    aq.add_argument("text")
+    aq.add_argument("--wait", type=float, default=15.0,
+                    help="最多等多少秒，0 表示投递即返回")
+    aq.add_argument("--conversation", default=None)
+    aq.add_argument("--force", action="store_true")
+    aq.add_argument("--reason", default="")
+    aq.set_defaults(func=cmd_ask)
+
+    rp = sub.add_parser("reply", help="回复某条消息（回复后这条链结束）")
+    rp.add_argument("msg_id")
+    rp.add_argument("text")
+    rp.add_argument("--to", default=None)
+    rp.set_defaults(func=cmd_reply)
+
+    ck = sub.add_parser("check", help="收信 + 摘要（通信前先跑这个）")
+    ck.add_argument("--wait", type=float, default=0.0)
+    ck.add_argument("--limit", type=int, default=20)
+    ck.set_defaults(func=cmd_check)
+
+    sub.add_parser("peers", help="本机有哪些对话、中继上还有谁").set_defaults(
+        func=cmd_peers)
 
     r = sub.add_parser("registry", help="启动注册中心")
     r.add_argument("--db", default="a2alink.sqlite3")
     r.add_argument("--host", default="127.0.0.1")
     r.add_argument("--port", type=int, default=8787)
     r.add_argument("--invite-code", default=None, help="非空时注册必须提供邀请码")
+    r.add_argument("--local-mesh", action="store_true",
+                   help="同机会话免好友审批（仅监听回环地址时生效，每次放行都写审计）")
     r.add_argument("-v", "--verbose", action="store_true")
     r.set_defaults(func=cmd_registry)
 
@@ -927,8 +1617,45 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+_GLOBAL_WITH_VALUE = ("--as", "--registry", "--home", "--scope", "--name", "--cap")
+
+
+def _hoist_global(argv: List[str]) -> List[str]:
+    """把全局选项从子命令后面提到最前面。
+
+    argparse 要求全局选项写在子命令之前，但没人会记得这个规则。真实的
+    写法几乎总是 ``a2alink say @运维 "..." --as 运维``，不处理的话用户只会
+    看到 "unrecognized arguments"，然后以为工具坏了。
+
+    与其在每个子 parser 上再注册一遍（argparse 会用子 parser 的 default
+    把父级已解析的值覆盖掉，是个经典坑），不如在解析前挪一下位置。
+    """
+    head: List[str] = []
+    rest: List[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        hit = next((g for g in _GLOBAL_WITH_VALUE
+                    if a == g or a.startswith(g + "=")), None)
+        if hit:
+            if "=" in a:
+                head.append(a)
+                i += 1
+            elif i + 1 < len(argv):
+                head.extend([a, argv[i + 1]])
+                i += 2
+            else:
+                rest.append(a)
+                i += 1
+            continue
+        rest.append(a)
+        i += 1
+    return head + rest
+
+
 def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(_hoist_global(raw))
     # 时间窗口换算成绝对时间戳，供审计查询使用
     hours = float(getattr(args, "hours", 24) or 0)
     args.since_s = 0.0 if hours <= 0 else time.time() - hours * 3600

@@ -37,6 +37,17 @@ keys/
 # 对端公钥固定表：泄露不致命（都是公钥），但会暴露你和谁通过信
 trust/
 
+# 会话别名表与本地消息索引（v0.3）
+# sessions.json 记着"我叫 @运维 的那个对话在哪台机器上是哪个 UUID"，
+# recent.json 存着最近收到谁的什么消息——都是本机才该有的东西。
+sessions.json
+sessions.json.lock
+recent.json
+
+# 自动拉起的中继留下的运行时文件
+registry-*.pid
+registry-*.log
+
 # 编辑器
 .vscode/
 .idea/

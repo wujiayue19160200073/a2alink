@@ -172,7 +172,8 @@ class Registry:
     def __init__(self, db_path: str = "a2alink.sqlite3",
                  invite_code: Optional[str] = None,
                  audit_enabled: bool = True,
-                 require_signature: bool = True) -> None:
+                 require_signature: bool = True,
+                 local_mesh: bool = False) -> None:
         self.db_path = db_path
         d = os.path.dirname(os.path.abspath(db_path))
         if d:
@@ -190,6 +191,17 @@ class Registry:
         # 默认要求签名。老部署要平滑迁移可临时设 False，
         # 但那样等于放弃"服务端这一层防冒充"，不是长期选项。
         self.require_signature = bool(require_signature)
+        # 同机互信：同一个 OS 用户下的多个对话，互发消息不要求先加好友。
+        #
+        # 这不是"开后门"，理由是本来就没有门：同一个 OS 用户能读
+        # ~/.a2alink/ 下所有私钥，能冒充任何本机身份，能直接改 SQLite。
+        # 在这个前提下要求本机会话互加好友，只是仪式，不是边界。
+        # 真正的边界是"这台机器别被别人用"。
+        #
+        # 但它**只在监听回环地址时**才允许打开（由 CLI 强制）。一旦对外
+        # 提供注册服务，注册者来自四面八方，免好友就等于允许陌生人直接
+        # 给任何人投递消息——那是投毒面，不是便利。
+        self.local_mesh = bool(local_mesh)
         self._rl: Dict[str, List[float]] = {}
         # 服务端审计也落一条哈希链。为什么不只靠 SQLite：
         # 数据库是"可 UPDATE、可 DELETE"的东西，一句 UPDATE audit SET detail=...
@@ -975,9 +987,18 @@ class Registry:
         self._verify_envelope(me, env)
 
         if env.to_type == "agent":
-            if self._friend_state(me, env.to_id) != "accepted":
-                raise RegistryError("not_friends",
-                                    "不是好友，消息被拒。请先走双向好友审批流程。", 403)
+            state = self._friend_state(me, env.to_id)
+            if state != "accepted":
+                if not self.local_mesh:
+                    raise RegistryError("not_friends",
+                                        "不是好友，消息被拒。请先走双向好友审批流程。", 403)
+                # 同机互信放行，但**必须留痕**。放行的记录比拒绝的记录更
+                # 重要：事后要回答的是"这条消息凭什么没走好友审批"。
+                self.audit(me, "send", f"to={env.to_id}",
+                           decision="note", reason="mesh.local_trust",
+                           trace=env.trace_id,
+                           extra={"peer_friend_state": state or "none",
+                                  "local_mesh": True})
             if not self._q("SELECT 1 FROM agents WHERE id=? AND status='active'", (env.to_id,)):
                 raise RegistryError("not_found", "对端 Agent 不存在或已停用", 404)
             recipients = [env.to_id]

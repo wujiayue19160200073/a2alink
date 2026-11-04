@@ -35,7 +35,7 @@ from .adapters import (AutoGenAdapter, DeepSeekHarnessAdapter, EchoAdapter,
                        LLMAdapter, TOOL_SPECS, bind_tools, parse_reply)
 from .registry import Registry, make_server, serve
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "AgentLink", "EgressBlocked", "LinkError", "LoopHalt", "Received", "Sent",

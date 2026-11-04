@@ -121,6 +121,47 @@ a2alink registry --db ./a2alink.sqlite3 --port 8787   # 默认只 bind 127.0.0.1
 - ✅ 冷启动友好：单机也能跑多 Agent 协作
 - ✅ 适合开发、实验、内网工具链
 
+#### 同机互信（`local_mesh`）的边界 —— v0.3
+
+`a2alink up` 拉起的本地中继默认开启同机互信：本机会话互发消息**免好友审批**。
+这不是把安全检查关掉了，是换了一个更诚实的判断，但必须知道它的确切含义：
+
+**它成立的前提**：同一个 OS 用户本来就能读 `~/.a2alink/` 下所有私钥、能直接改
+`registry.sqlite3`、能冒充本机任何身份。在这个前提下要求本机会话互加好友，
+只是一道自己演给自己看的仪式。
+
+**所以它等同于**：`本机所有以该 OS 用户身份运行的进程 = 一个信任域`。
+
+**什么时候必须关掉**：
+
+- 这台机器上有别人的 Agent、别人的脚本、或不可信的本地服务
+- 你给别的用户开了登录账号
+- 机器是共享开发机 / CI runner
+
+```bash
+a2alink up --no-mesh        # 回到严格模式
+```
+
+**代码层面的硬限制**（不是靠自觉）：
+
+- `Registry(local_mesh=True)` 只在 `--host 127.0.0.1/localhost/::1` 时被构造出来；
+  CLI 对非回环地址**强制关闭并打印警告**，不做静默降级。
+- 每次免审批放行都写**服务端**审计（`mesh.local_trust`）。
+- 跨机器通信**永远**需要双向好友，没有任何开关。
+
+查这些放行记录（服务端审计在注册中心的 SQLite 里，不在客户端日志链）：
+
+```sql
+-- ~/.a2alink/registry.sqlite3（或你 --db 指定的位置）
+SELECT datetime(ts,'unixepoch','localtime') AS t, actor, detail, reason
+FROM audit WHERE reason = 'mesh.local_trust' ORDER BY ts DESC LIMIT 50;
+```
+
+> 注意区分两套审计：`a2alink logs ...` 查的是**本机客户端**的哈希链（谁发了什么、
+> 哪条被闸门拦了）；服务端 SQLite 记的是**注册中心**看到的事（谁注册、谁被拒、
+> 哪条消息免审批放行）。出事故时两套都要看，它们回答的是不同问题。
+
+
 ### 4.2 内网多机
 
 ```bash
