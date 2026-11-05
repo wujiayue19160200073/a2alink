@@ -14,6 +14,14 @@ from a2alink.client import AgentLink, EgressBlocked, LinkError
 from a2alink.registry import Registry, make_server
 
 
+# 测试绝不能写进真实的 ~/.a2alink。
+# 出站闸门判 BLOCK 时默认会把内容挂进审批队列，而测试用例里
+# 故意带着"密钥"形态的字符串——一次跑测试就在用户目录里留下一堆
+# 待批的假机密，还会让 `approvals list` 和审计报告失真。
+os.environ.setdefault("A2ALINK_HOME", tempfile.mkdtemp(prefix="a2a-test-"))
+
+
+
 def free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -377,13 +385,16 @@ class TestAuditTrail(unittest.TestCase):
     def test_blocked_message_is_audited_with_reason_code(self):
         a, b = self.client("au-a"), self.client("au-b")
         self.befriend(a, b)
+        # v0.5 起默认行为是"挂起等人批准"，不再是直接丢弃；
+        # 所以理由码从 egress.deny 变成 gate.hold。留痕这条要求没变。
         with self.assertRaises(EgressBlocked):
             a.send_text("au-b", "key 是 AKIAIOSFODNN7EXAMPLE")
-        recs = a.audit.read(limit=50, decision="deny")
-        hit = [r for r in recs if r["reason"] == "egress.deny"]
-        self.assertTrue(hit, "DLP 拦截必须留下理由码记录")
+        recs = a.audit.read(limit=50, decision="note")
+        hit = [r for r in recs if r["reason"] == "gate.hold"]
+        self.assertTrue(hit, "挂起必须留下理由码记录")
         self.assertIn("cloud_ak", hit[0]["detail"]["rules"])
-        # 拦截记录里不能有明文密钥
+        self.assertTrue(hit[0]["detail"].get("pending"), "记录里要有审批件 ID 才能追踪")
+        # 记录里不能有明文密钥
         with open(a.audit._path, encoding="utf-8") as fh:
             raw = fh.read()
         self.assertNotIn("AKIAIOSFODNN7EXAMPLE", raw)

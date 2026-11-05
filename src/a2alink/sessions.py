@@ -54,6 +54,13 @@ RESERVED_LABELS = {"me", "self", "all", "everyone", "system", "a2alink"}
 # 别名允许中文——用户给对话起名"运维""写手"是自然的事。
 LABEL_RE = re.compile(r"[A-Za-z0-9_\-\u4e00-\u9fa5]{2,24}")
 
+# 标签和别名是两件不同的东西，别混：
+#   别名 = 唯一的名字，一台机器上一人一名，用 @ 找它就是找那个人
+#   标签 = 可共享的属性（"值班""数据库"），多个人可以都是"值班"
+# 所以按标签找可能命中多个，这不叫错误配置，叫"你得说得再具体点"。
+TAG_RE = re.compile(r"[A-Za-z0-9_\-\u4e00-\u9fa5]{1,16}")
+MAX_TAGS = 8
+
 # 会话 ID 只接受这些字符。宿主给的是 UUID，但 A2ALINK_SESSION 是用户输入，
 # 它会被拼进文件路径，必须挡掉 ``../`` 这类东西。
 SID_RE = re.compile(r"[A-Za-z0-9_\-.]{4,80}")
@@ -83,6 +90,40 @@ def short(sid: str) -> str:
     又比整串 UUID 好念——这个名字会出现在每一条消息的署名里。"""
     clean = re.sub(r"[^A-Za-z0-9]", "", sid)
     return (clean or sid)[:10]
+
+
+def normalize_tags(tags: Any) -> List[str]:
+    """把用户给的一堆标签整理成干净的列表。
+
+    去空、去重、保序、大小写不敏感去重（但保留首次书写形式）。
+    非法标签**直接报错**而不是悄悄丢掉：丢掉的后果是"我明明打了这个标签，
+    为什么按它找不到人"——这种问题靠猜是查不出来的。
+    """
+    if tags is None:
+        return []
+    if isinstance(tags, str):
+        raw = re.split(r"[,，\s]+", tags)
+    else:
+        raw = []
+        for t in tags:
+            raw.extend(re.split(r"[,，\s]+", str(t)))
+    out: List[str] = []
+    seen = set()
+    for t in raw:
+        t = t.strip().lstrip("#")
+        if not t:
+            continue
+        if not TAG_RE.fullmatch(t):
+            raise SessionError(
+                f"标签 {t!r} 不合法：1-16 个中英文、数字、下划线或短横线")
+        key = t.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(t)
+    if len(out) > MAX_TAGS:
+        raise SessionError(f"标签最多 {MAX_TAGS} 个，给了 {len(out)} 个")
+    return out
 
 
 class _FileLock:
@@ -199,7 +240,18 @@ class SessionStore:
         return max(rows, key=lambda r: float(r.get("last_seen") or 0))
 
     def resolve(self, who: str) -> Optional[str]:
-        """把 ``@ops`` / ``ops`` / ``<sid>`` / ``<sid 前缀>`` 解析成完整 sid。"""
+        """把 ``@ops`` / ``ops`` / 标签 / ``<sid>`` / ``<sid 前缀>`` 解析成完整 sid。
+
+        匹配顺序有讲究，不是随手排的：
+
+        1. **完整 sid**——最精确，一个字符都不能差
+        2. **别名**——人给这个对话起的唯一名字，语义最强
+        3. **标签**——共享属性，命中多个必须报歧义并列候选
+        4. **sid 前缀**——弱匹配，放最后，避免把标签名当成 ID 前缀
+
+        标签放在前缀之前，是因为"发给值班的人"这种意图比"发给 ID 以 3f 开头的人"
+        更像人真实想做的事。
+        """
         w = str(who or "").strip().lstrip("@")
         if not w:
             return None
@@ -209,6 +261,22 @@ class SessionStore:
         rec = d["sessions"].get(d["aliases"].get(w.lower(), ""))
         if rec:
             return rec["sid"]
+        # 标签可能命中多个。命中多个不是配置错误，是"问得太笼统"——
+        # 必须列候选让人选。瞎挑一个的后果是任务发给了错的人，
+        # 而两边都觉得自己没错（"我发了" / "我没收到"）。
+        tagged = [r for r in d["sessions"].values()
+                  if any(str(t).lower() == w.lower()
+                         for t in (r.get("tags") or []))]
+        if len(tagged) == 1:
+            return tagged[0]["sid"]
+        if len(tagged) > 1:
+            tagged.sort(key=lambda r: float(r.get("last_seen") or 0), reverse=True)
+            names = "、".join(
+                (f"@{r['label']}" if r.get("label") else short(r["sid"]))
+                for r in tagged)
+            raise SessionError(
+                f"标签 {w!r} 有 {len(tagged)} 个会话在用（{names}），"
+                f"请改用具体别名或会话 ID。")
         # 前缀匹配：允许 a2alink say 3f2a1b44 "..."，但必须唯一
         hits = [s for s in d["sessions"] if s.startswith(w)]
         if len(hits) == 1:
@@ -219,11 +287,14 @@ class SessionStore:
 
     # ------------------------------------------------------------ 写入
     def bind(self, sid: str, label: Optional[str] = None,
-             agent_name: Optional[str] = None) -> Dict[str, Any]:
+             agent_name: Optional[str] = None,
+             tags: Any = None) -> Dict[str, Any]:
         """建立或更新一个会话身份。返回记录。
 
         ``agent_name`` 已存在时**不会被覆盖**——除非显式传入且记录里还没有。
         这是本模块最重要的一条约束，见文件头注释第 1 条。
+
+        ``tags`` 为 None 表示"别动现有标签"；传空列表表示"清空"。
         """
         if not SID_RE.fullmatch(sid or ""):
             raise SessionError(f"会话 ID 非法: {sid!r}")
@@ -236,6 +307,7 @@ class SessionStore:
                     "别名要求 2-24 个字符，只能用中英文、数字、下划线、短横线")
             if label_clean.lower() in RESERVED_LABELS:
                 raise SessionError(f"{label_clean!r} 是保留字，换一个")
+        tags_clean = None if tags is None else normalize_tags(tags)
 
         with _FileLock(self._lock_path):
             d = self._read()
@@ -247,6 +319,7 @@ class SessionStore:
                     "label": None,
                     "agent_name": agent_name or f"s-{short(sid)}",
                     "home": os.path.join(self.root, "sessions", short(sid)),
+                    "tags": tags_clean or [],
                     "created_at": now,
                     "last_seen": now,
                 }
@@ -258,6 +331,9 @@ class SessionStore:
                 # 兼容早期记录：没有 agent_name 的补一个，已有的一律不动
                 if not rec.get("agent_name"):
                     rec["agent_name"] = agent_name or f"s-{short(sid)}"
+                if tags_clean is not None:
+                    rec["tags"] = tags_clean
+                rec.setdefault("tags", [])
 
             if label_clean:
                 key = label_clean.lower()
@@ -276,6 +352,33 @@ class SessionStore:
 
             self._write(d)
             return dict(rec)
+
+    def set_tags(self, sid: str, tags: Any) -> Dict[str, Any]:
+        """整体替换标签。传空列表即清空。"""
+        clean = normalize_tags(tags)
+        with _FileLock(self._lock_path):
+            d = self._read()
+            rec = d["sessions"].get(sid)
+            if rec is None:
+                raise SessionError(f"没有这个会话: {sid}")
+            rec["tags"] = clean
+            rec["last_seen"] = time.time()
+            self._write(d)
+            return dict(rec)
+
+    def find_by_tag(self, tag: str) -> List[Dict[str, Any]]:
+        """按标签找人。可能返回多个——标签是共享属性，不是唯一名字。
+
+        按最近活跃排序：同一个标签下有多个会话时，"最近用过那个"最可能是
+        你要找的，但它**不能**替你做决定，所以调用方要显示候选让人选。
+        """
+        key = str(tag or "").strip().lstrip("#").lower()
+        if not key:
+            return []
+        rows = [dict(r) for r in self._read()["sessions"].values()
+                if any(str(t).lower() == key for t in (r.get("tags") or []))]
+        rows.sort(key=lambda r: float(r.get("last_seen") or 0), reverse=True)
+        return rows
 
     def touch(self, sid: str) -> None:
         """只更新 last_seen。高频调用，出错就静默——统计不该影响主流程。"""
@@ -343,8 +446,14 @@ class SessionIdentity:
         return self.record["home"]
 
     @property
+    def tags(self) -> List[str]:
+        return list(self.record.get("tags") or [])
+
+    @property
     def display(self) -> str:
-        return f"@{self.label}" if self.label else short(self.sid)
+        if self.label:
+            return f"@{self.label}"
+        return short(self.sid)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -352,6 +461,7 @@ class SessionIdentity:
             "label": self.label,
             "agent_name": self.agent_name,
             "home": self.home,
+            "tags": self.tags,
             "source": self.source,
             "created_at": self.record.get("created_at"),
             "last_seen": self.record.get("last_seen"),

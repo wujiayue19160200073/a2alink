@@ -44,6 +44,12 @@ sessions.json
 sessions.json.lock
 recent.json
 
+# 待批内容（v0.5）
+# 这里躺着的正是"被判定不该外发"的原文——虽然已加密，但它是本项目
+# 最不该被 commit 的东西。密钥也一起挡住：两者同时泄露等于没加密。
+approvals/
+approvals.key
+
 # 自动拉起的中继留下的运行时文件
 registry-*.pid
 registry-*.log

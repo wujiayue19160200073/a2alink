@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .abuse import PropagationBlocked, PropagationGuard, ProvenanceError
+from .approvals import ApprovalError, ApprovalStore
 from .audit import AuditLog, fingerprint, mask
 from .crypto import (CryptoError, DecryptionError, KeyMismatchError,
                      KeyStore, SignatureError, b64d, b64e as _b64e,
@@ -63,6 +64,39 @@ class EgressBlocked(LinkError):
         super().__init__("egress_blocked",
                          "出站内容未通过安全闸门：" + "; ".join(result.reasons or ["命中敏感信息"]))
         self.result = result
+
+
+class ApprovalRequired(EgressBlocked):
+    """内容被拦下，但**已经挂起等人决定**，不是死路。
+
+    继承 EgressBlocked 是有意的：它确实是"出站被闸门拦下"的一种，
+    只是多了后续可能（人批准后能原样重发）。这样既有的
+    ``except EgressBlocked`` 代码不用改就能继续工作，不会因为升级
+    而突然漏掉一类本该拦住的东西。
+
+    但三种区别必须说清楚：
+
+    - 和 ``EgressBlocked`` 的区别：那条消息已经丢了（没存），这条还在队列里。
+      所以 CLI 不能报"发送失败"，要报"等你决定"。
+    - 和"已发送"的区别：它没有发出，对方什么都收不到。任何把它当成
+      "发了"的处理都会造成"我说发了、你说没收到"。
+    - 和"审批通过"的区别：``hold`` 只是排队，不是批准。别把排队当默许。
+    """
+
+    def __init__(self, pending: Dict[str, Any],
+                 result: Optional[GuardResult] = None) -> None:
+        pid = pending.get("id", "")
+        # 不走 EgressBlocked.__init__：那句话是"未通过闸门"，而这里
+        # 准确的说法是"拦下了，但等你决定"。措辞差别会改变人的下一步动作。
+        LinkError.__init__(
+            self, "approval_required",
+            f"内容含敏感信息，已挂起等你决定（{pid}）。"
+            f"看到内容：a2alink approvals show {pid}；"
+            f"批准发送：a2alink approvals approve {pid} --reason \"...\" --yes；"
+            f"拒绝：a2alink approvals deny {pid} --reason \"...\"")
+        self.pending = pending
+        self.result = result
+        self.pending_id = pid
 
 
 class LoopHalt(LinkError):
@@ -136,7 +170,9 @@ class AgentLink:
                  audit_enabled: bool = True,
                  encrypt: str = "auto",
                  trust_policy: str = POLICY_TOFU,
-                 require_signature: bool = True) -> None:
+                 require_signature: bool = True,
+                 hold_on_block: bool = True,
+                 approvals: Optional[ApprovalStore] = None) -> None:
         self.registry = registry.rstrip("/")
         self.name = name or f"agent-{new_id()[:6]}"
         self.capabilities = capabilities or []
@@ -152,6 +188,15 @@ class AgentLink:
         self.ingress = IngressGuard()
         # 扩散保险丝：默认开启，转发默认关闭。这两条是"协议不被拿去作恶"的底线。
         self.propagation = propagation or PropagationGuard(allow_forward=allow_forward)
+
+        # 被拦下的内容默认**挂起等人决定**，而不是直接丢弃。
+        # 直接丢会把使用者逼向一条更差的路：改成能过闸门的样子再发，
+        # 于是审计链上留下一条干净的 allow，而真正的机密出去了。
+        # 挂起件放在 ~/.a2alink/approvals 而不是本 agent 的 home：
+        # 那是"本机所有人待处理的事"，分散到每个会话里就没人看了。
+        self.hold_on_block = bool(hold_on_block)
+        self.approvals = approvals or ApprovalStore()
+
         self.invite_code = invite_code
         self._cursor = 0
         self.agent_id = ""
@@ -188,6 +233,48 @@ class AgentLink:
         """写审计。审计未启用时静默跳过（enabled=False 是显式的降级选择）。"""
         self.audit.write(event, decision, reason, trace=trace, detail=detail,
                          evidence=evidence, preview=preview)
+
+    def _hold_blocked(self, egress: GuardResult, *, peer: str, scope: str,
+                      act: str, stage: str, payload: Dict[str, Any],
+                      trace: str, conversation_id: Optional[str],
+                      in_reply_to: Optional[str], ttl_seconds: int,
+                      ttl_hops: int) -> ApprovalRequired:
+        """把被拦下的消息挂进审批队列，返回待 raise 的异常。
+
+        返回异常而不是直接 raise，是为了让调用点只有一处 ``raise``，
+        读代码时不会漏掉"这里其实还有一条出路"。
+        """
+        findings: List[Dict[str, Any]] = []
+        for f in (egress.findings or []):
+            try:
+                findings.append(f.to_dict())
+            except AttributeError:
+                findings.append({"rule": str(getattr(f, "rule", "unknown"))})
+        try:
+            pending = self.approvals.hold(
+                requester=self.agent_id, session=self.name, peer=peer,
+                scope=scope, act=act, stage=stage, payload=payload,
+                findings=findings, level=egress.level, trace=trace,
+                replay={"ttl_seconds": ttl_seconds, "ttl_hops": ttl_hops,
+                        "conversation_id": conversation_id,
+                        "in_reply_to": in_reply_to})
+        except (ApprovalError, OSError) as e:
+            # 挂不住（磁盘满、权限、密钥坏了）就只能回到"拦死"。
+            # 但必须把原因写进审计：否则使用者只看到"发送失败"，
+            # 会以为是网络问题而反复重试。
+            self._audit("gate.egress", "deny", "egress.hold_failed", trace,
+                        detail={"peer": peer, "err": str(e)[:160]},
+                        evidence=fingerprint(payload))
+            return ApprovalRequired(
+                {"id": "", "status": "pending", "peer": peer,
+                 "rules": sorted({f["rule"] for f in findings})},
+                egress)
+        self._audit("gate.egress", "note", "gate.hold", trace,
+                    detail={"peer": peer, "pending": pending["id"],
+                            "rules": pending["rules"], "level": egress.level,
+                            "expires_at": pending.get("expires_at")},
+                    evidence=fingerprint(payload))
+        return ApprovalRequired(pending, egress)
 
     # ------------------------------------------------------------------
     # 身份
@@ -504,6 +591,16 @@ class AgentLink:
                 "rules": rules, "findings": len(egress.findings)}
         if egress.action == BLOCK:
             if not force:
+                # 挂起时**不写** egress.deny：这条内容并没有被丢弃，它还在
+                # 队列里等人决定。两样都写会让报告里"拦截"和"挂起"重复计数，
+                # 而这两个数回答的是不同问题——
+                # "多少内容被彻底挡住" vs "多少在等人做决定"。
+                if self.hold_on_block:
+                    raise self._hold_blocked(
+                        egress, peer=peer, scope=scope, act=act, stage=stage,
+                        payload=payload, trace=trace,
+                        conversation_id=conversation_id, in_reply_to=in_reply_to,
+                        ttl_seconds=ttl_seconds, ttl_hops=ttl_hops)
                 self._audit("gate.egress", "deny", "egress.deny", trace,
                             detail=base, evidence=fp, preview=preview)
                 raise EgressBlocked(egress)

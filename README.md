@@ -5,7 +5,7 @@
 零第三方依赖 · 单文件 SQLite · 本地优先 · 端到端加密 + 消息签名
 · 内置防泄密闸门与死循环看门狗
 
-当前版本 **v0.4.0** · [变更记录](CHANGELOG.md) · [版本规划](docs/VERSIONING.md) ·
+当前版本 **v0.5.0** · [变更记录](CHANGELOG.md) · [版本规划](docs/VERSIONING.md) ·
 [许可：非商业免费 / 商用需授权](COMMERCIAL.md)
 
 > **这不是 OSI 开源项目，是 source-available。** 非商业用途免费，商业用途须事先
@@ -173,6 +173,43 @@ a2alink up --will "我掉线了，手上的回归没跑完" --will-to @运维 --
 本机对话之间也不行——对方可能带着这段内容去访问外网。出站有 DLP 闸门，
 但它只兜已知形态；业务数据能不能出域，只有人知道。详见
 [SECURITY.md](SECURITY.md) 与 [docs/skill-install.md](docs/skill-install.md)。
+
+### 怎么找到"对的那个对话"
+
+一个 Agent 有几个对话时，靠两样东西定位，它们不是一回事：
+
+| | 别名 | 标签 |
+|---|---|---|
+| 数量 | 一台机器上**唯一** | 多个对话**可共享** |
+| 例子 | `@运维`、`@写手` | `值班`、`数据库` |
+| 按它发 | 一定命中 | 唯一时才行，多个会报歧义 |
+
+```bash
+a2alink session tag 值班,数据库      # 这个对话负责什么
+a2alink peers                       # 本机有谁、各管什么、还活着吗
+a2alink say 数据库 "主从延迟 30s"     # 标签唯一时可直接发
+```
+
+**命中多个时报错，不替你挑。** 自动挑一个的后果是任务发给了错的人，
+而两边都觉得自己没错。完整规则（含"为什么不能让另一个 Agent 新开对话"）见
+[docs/addressing.md](docs/addressing.md)。
+
+### 被拦下了怎么办：它现在会问你，而不是直接丢
+
+出站闸门判定内容不能出这个域时，消息**不会发出，也不会消失**——它进队列等你决定：
+
+```bash
+a2alink approvals list                # 有什么在等我
+a2alink approvals show apv-xxx        # 看原文（只在终端，不落盘）
+a2alink approvals approve apv-xxx --reason "客户已授权" --yes
+a2alink approvals deny  apv-xxx --reason "不许外发"     # 内容立即销毁
+```
+
+内容加密存储（本机主密钥，`0600`），24 小时不处理就清空正文并标 expired。
+**批准必须 `--yes` + 理由**：这个动作会把内容送出组织边界，不能有一步是无声的。
+`approve` 会以**原身份**重发，不是用你当前窗口的身份。
+
+完整走查、密级模型与"它挡不住什么"，见 [docs/cross-org.md](docs/cross-org.md)。
 
 ---
 
@@ -540,6 +577,11 @@ a2alink keys pin <对端> --expect <你从电话里听到的指纹> --yes
 | `a2alink inflight` | 已读但没标完成的消息——**可能掉在地上的任务** |
 | `a2alink dlq list/requeue/purge` | 死信队列：查看 / 重投 / 清理 |
 | `a2alink will set/show/clear` | 遗嘱：我掉线了，替我发这句话 |
+| `a2alink session tag 值班,数据库` | 给对话打标签（可共享），支持 `say 值班 "..."` |
+| `a2alink approvals list` | 被拦下等决定的消息——**只有人能批** |
+| `a2alink approvals show <编号>` | 看被拦的原文（只在终端显示，不落盘） |
+| `a2alink approvals approve <编号> --reason "..." --yes` | 批准并按原内容发出 |
+| `a2alink logs report` | 安全审计摘要，离线可跑 |
 | `a2alink peers` | 本机有哪些对话、中继上还有谁 |
 | `a2alink registry` | 起注册中心（默认 127.0.0.1） |
 | `a2alink whoami` | 我是谁、我的出站策略、我的看门狗阈值 |
@@ -612,9 +654,10 @@ a2alink keys pin <对端> --expect <你从电话里听到的指纹> --yes
 | v0.1.2 | 可追责审计链（哈希链 + 理由码 + `trace`/`incident`） | 已发布 |
 | v0.2.0 | Ed25519 签名 + X25519 端到端加密 + 公钥固定 | 已发布 |
 | v0.3.0 | 一键装成 Skill + 跨对话信箱（会话身份 / 自动中继 / 同机互信） | 已发布 |
-| **v0.4.0** | **可靠投递：已读≠做完、死信队列、遗嘱消息、回复链** | **当前** |
-| v0.5.0 | 本地可视化会话台（看得见 Agent 在聊什么）· [设计稿](docs/visual-console.md) | 规划 |
-| v0.6.0 | 真实框架适配器打磨 + relay 转发（带四道闸） | 规划 |
+| v0.4.0 | 可靠投递：已读≠做完、死信队列、遗嘱消息、回复链 | 已发布 |
+| **v0.5.0** | **寻址（别名/标签）+ 跨网机密审批（挂起→人批→重发）+ 审计报告** | **当前** |
+| v0.6.0 | 本地可视化会话台（看得见 Agent 在聊什么）· [设计稿](docs/visual-console.md) | 规划 |
+| v0.7.0 | 真实框架适配器打磨 + relay 转发（带四道闸） | 规划 |
 | v1.0.0 | 信封协议冻结 | 规划 |
 
 语义化版本规则、"什么算破坏性"、弃用流程见 [docs/VERSIONING.md](docs/VERSIONING.md)。

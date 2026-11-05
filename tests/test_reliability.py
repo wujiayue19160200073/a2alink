@@ -21,6 +21,14 @@ from a2alink.protocol import MAX_REFERENCES, Envelope, ProtocolError
 from a2alink.registry import Registry, make_server
 
 
+# 测试绝不能写进真实的 ~/.a2alink。
+# 出站闸门判 BLOCK 时默认会把内容挂进审批队列，而测试用例里
+# 故意带着"密钥"形态的字符串——一次跑测试就在用户目录里留下一堆
+# 待批的假机密，还会让 `approvals list` 和审计报告失真。
+os.environ.setdefault("A2ALINK_HOME", tempfile.mkdtemp(prefix="a2a-test-"))
+
+
+
 def free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))

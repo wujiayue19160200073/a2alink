@@ -29,7 +29,8 @@ from typing import Any, Dict, List, Optional
 
 from . import __version__
 from .adapters import EchoAdapter, LLMAdapter
-from .client import AgentLink, EgressBlocked, LinkError, LoopHalt
+from .client import (AgentLink, ApprovalRequired, EgressBlocked, LinkError,
+                     LoopHalt)
 from .guard import COMPLIANCE_CHECKLIST, EgressGuard, compliance_report
 from .registry import Registry, serve
 
@@ -167,6 +168,8 @@ def cmd_send(args: argparse.Namespace) -> int:
                    ttl_hops=args.hops, ttl_seconds=args.ttl,
                    max_messages=args.max_messages, max_tokens=args.max_tokens,
                    force=args.force, force_reason=args.reason)
+    except ApprovalRequired as e:
+        return _print_hold(e)
     except EgressBlocked as e:
         print(f"🚫 出站被拦：{e.message}", file=sys.stderr)
         _p(e.result.to_dict())
@@ -271,23 +274,68 @@ def cmd_guard(args: argparse.Namespace) -> int:
 # 审计日志：查得到、验得动、说得清
 # ----------------------------------------------------------------------
 def _audit_root(args: argparse.Namespace) -> str:
-    """定位审计目录。找不到或有歧义时明确报错，绝不"猜一个最近的"。"""
+    """定位审计目录。
+
+    以前这里写死 ``~/.a2alink``，于是两件事同时坏掉：设了
+    ``A2ALINK_HOME`` 的环境（容器、测试、自定义安装路径）全部查不到日志；
+    v0.3 引入的会话身份把日志搬进了 ``sessions/<id>/logs``，这里也不认识。
+
+    解析顺序按"人想查什么"排：
+    ``--home`` > ``--name`` > 当前会话 > 唯一候选 > 报歧义。
+    查日志最常问的是"我刚才发了什么"，所以当前会话排在兜底之前。
+    """
     if getattr(args, "home", None):
         return os.path.join(args.home, "logs")
-    base = os.path.join(os.path.expanduser("~"), ".a2alink")
-    if getattr(args, "name", None):
-        return os.path.join(base, AgentLink._safe(args.name), "logs")
-    if not os.path.isdir(base):
-        raise LinkError("no_logs", f"没有找到审计目录 {base}，请用 --name 或 --home 指定")
-    cands = [os.path.join(base, n, "logs") for n in sorted(os.listdir(base))]
-    cands = [c for c in cands if os.path.isdir(c)]
+    from . import sessions
+    base = sessions._default_root()        # 已考虑 A2ALINK_HOME
+    st = sessions.SessionStore()
+
+    name = getattr(args, "name", None)
+    if name:
+        want = str(name).lstrip("@")
+        for _sid, r in st.all().items():
+            if r.get("agent_name") == want or r.get("label") == want:
+                return os.path.join(str(r.get("home")), "logs")
+        legacy = os.path.join(base, AgentLink._safe(str(name)), "logs")
+        if os.path.isdir(legacy):
+            return legacy
+        raise LinkError("no_logs", f"找不到 {name} 的审计目录，"
+                                   f"用 a2alink session list 看有哪些身份")
+
+    # 当前会话：不调用 sessions.current()，它会 touch 文件；
+    # 一个"只看日志"的命令不该顺手改状态。
+    sid = getattr(args, "as_", None)
+    if sid:
+        try:
+            sid = st.resolve(str(sid))
+        except Exception:
+            sid = None
+    else:
+        sid = sessions.session_id_from_env()
+    if sid:
+        rec = st.get(str(sid))
+        if rec:
+            cand = os.path.join(str(rec.get("home") or ""), "logs")
+            if os.path.isdir(cand):
+                return cand
+
+    cands: List[str] = []
+    for root_dir in (base, os.path.join(base, "sessions")):
+        if not os.path.isdir(root_dir):
+            continue
+        for n in sorted(os.listdir(root_dir)):
+            p = os.path.join(root_dir, n, "logs")
+            if os.path.isdir(p):
+                cands.append(p)
     if not cands:
         raise LinkError("no_logs", f"{base} 下没有任何 Agent 的审计目录")
     if len(cands) == 1:
         return cands[0]
-    names = ", ".join(os.path.basename(os.path.dirname(c)) for c in cands)
+    names = ", ".join(c.replace(base + os.sep, "").replace(os.sep + "logs", "")
+                      for c in cands)
     raise LinkError("ambiguous_home",
-                    f"本机有多个 Agent 的日志（{names}），请用 --name 指定查哪一个")
+                    f"本机有多份日志（{names}），用 --name 指定查哪一个，"
+                    f"或 --home 给绝对路径")
 
 
 def _open_log(args: argparse.Namespace) -> Any:
@@ -326,6 +374,9 @@ def cmd_logs(args: argparse.Namespace) -> int:
                   "先别清理现场，保留原始文件，再按 docs/logging.md 的取证流程走。",
                   file=sys.stderr)
         return 0 if rep["ok"] else 5
+
+    if action == "report":
+        return _logs_report(log, args)
 
     if action == "stats":
         _p(log.stats())
@@ -384,6 +435,146 @@ def cmd_logs(args: argparse.Namespace) -> int:
     if args.summary:
         denied = sum(1 for r in recs if r.get("decision") in ("deny", "drop"))
         print(f"\n共 {len(recs)} 条，其中被拦 {denied} 条")
+    return 0
+
+
+def _logs_report(log: Any, args: argparse.Namespace) -> int:
+    """给人看的安全审计报告。
+
+    和 ``logs stats`` 的区别：stats 回答"有多少条"，report 回答
+    **"这段时间里有没有需要我处理的事"**。所以它必须离线可跑——
+    出事时注册中心往往正好连不上，而那时才最需要看这份东西。
+    """
+    since = float(getattr(args, "since_s", 0.0) or 0.0)
+    recs = log.read(limit=0, since=since)
+    window = "全部" if since <= 0 else _rel(since).replace("前", "")
+
+    if getattr(args, "as_json", False):
+        by_dec: Dict[str, int] = {}
+        by_reason: Dict[str, int] = {}
+        rules: Dict[str, int] = {}
+        for r in recs:
+            by_dec[r.get("decision", "?")] = by_dec.get(r.get("decision", "?"), 0) + 1
+            by_reason[r.get("reason", "?")] = by_reason.get(r.get("reason", "?"), 0) + 1
+            for rl in ((r.get("detail") or {}).get("rules") or []):
+                rules[rl] = rules.get(rl, 0) + 1
+        _p({"window": window, "records": len(recs), "by_decision": by_dec,
+            "by_reason": by_reason, "rules": rules,
+            "chain": log.verify()})
+        return 0
+
+    print(f"═══ 安全审计报告 ═══")
+    print(f"范围：最近 {window}    记录：{len(recs)} 条")
+    if not recs:
+        print("\n这段时间没有任何通信记录。")
+        print("如果不是新装的，先确认审计目录对不对：a2alink whoami")
+        return 0
+
+    by_dec: Dict[str, int] = {}
+    by_reason: Dict[str, int] = {}
+    rules: Dict[str, int] = {}
+    overrides: List[Dict[str, Any]] = []
+    holds: Dict[str, Dict[str, Any]] = {}
+    redacted: List[Dict[str, Any]] = []
+    for r in recs:
+        d = r.get("decision", "?")
+        by_dec[d] = by_dec.get(d, 0) + 1
+        rs = r.get("reason", "?")
+        by_reason[rs] = by_reason.get(rs, 0) + 1
+        det = r.get("detail") or {}
+        for rl in (det.get("rules") or []):
+            rules[str(rl)] = rules.get(str(rl), 0) + 1
+        if rs in ("egress.override", "propagation.override"):
+            overrides.append(r)
+        elif rs == "gate.hold":
+            holds[str(det.get("pending") or "-")] = r
+        elif rs == "egress.redact":
+            redacted.append(r)
+
+    # ---------- 出站处置 ----------
+    allow = by_dec.get("allow", 0) + by_dec.get("note", 0)
+    deny = by_dec.get("deny", 0) + by_dec.get("drop", 0)
+    redact = by_dec.get("redact", 0)
+    print("\n【出站处置】")
+    print(f"  放行          {allow}")
+    print(f"  脱敏后放行    {redact}")
+    print(f"  拦截          {deny}")
+    print(f"  挂起待批      {len(holds)}")
+    print(f"  人工放行      {len(overrides)}"
+          + ("   ← 有人越过了闸门" if overrides else ""))
+
+    if rules:
+        print("\n【命中的规则】")
+        top = sorted(rules.items(), key=lambda kv: -kv[1])[:8]
+        widest = max(v for _k, v in top) or 1
+        for name, cnt in top:
+            bar = "█" * max(1, int(12 * cnt / widest))
+            print(f"  {name:<18} {cnt:>4}  {bar}")
+
+    # ---------- 需要人处理的事 ----------
+    todo: List[str] = []
+    for r in overrides:
+        det = r.get("detail") or {}
+        todo.append(f"人工放行 trace={(r.get('trace') or '-')}："
+                    f"理由「{det.get('force_reason') or '未记录'}」")
+    for pid, r in holds.items():
+        todo.append(f"挂起未决 {pid}（{_rel(r.get('ts'))}）"
+                    f"  看内容：a2alink approvals show {pid}")
+
+    try:
+        from .approvals import ApprovalStore
+        ap = ApprovalStore().stats()
+        # 只在队列里的待批比本次窗口里看到的更多时才补一句：
+        # 本次窗口已经逐条列过的不重复罗列，否则同一件事会出现两遍，
+        # 人就会开始怀疑"到底有几条"。
+        if ap.get("pending", 0) > len(holds):
+            oldest = ap.get("oldest_pending")
+            age = f"，最老一条在 {_rel(oldest)}" if oldest else ""
+            todo.append(f"另有 {ap['pending'] - len(holds)} 条待批在窗口之外{age}"
+                        f"  用 a2alink approvals list 看")
+    except Exception:
+        pass
+
+    if todo:
+        print("\n【需要你看一眼】")
+        for t in todo[:20]:
+            print(f"  · {t}")
+        if len(todo) > 20:
+            print(f"  …还有 {len(todo)-20} 条，用 a2alink logs search 查")
+    else:
+        print("\n【需要你看一眼】")
+        print("  （没有）")
+
+    # ---------- 链完整性 ----------
+    print("\n【审计链完整性】")
+    try:
+        rep = log.verify()
+    except Exception as e:
+        print(f"  ⚠️ 校验失败：{e}（这份日志暂时不能当证据用）")
+        return 1
+    if rep["ok"]:
+        # 链是全部历史，本窗口只是其中一段。两个数不一样是正常的，
+        # 但不说明白就会让人以为"是不是丢了记录"。
+        extra = "" if rep["records"] == len(recs) else f"，本窗口内 {len(recs)} 条"
+        print(f"  ✅ 链上共 {rep['records']} 条{extra}，{len(rep['chains'])} 条链，无断点")
+    else:
+        print(f"  ❌ 发现 {len(rep['errors'])} 处异常，这份日志不能作为证据")
+        for e in rep["errors"][:5]:
+            print(f"     {e.get('kind')} @ seq={e.get('seq','-')}")
+        print("     先别清理现场，按 docs/logging.md 的取证流程走。")
+        return 5
+
+    # ---------- 一句话结论 ----------
+    print("\n【结论】")
+    if deny or overrides or holds:
+        print(f"  这段时间有 {deny} 次拦截、{len(overrides)} 次人工放行、"
+              f"{len(holds)} 条挂起。")
+        if overrides:
+            print("  人工放行是唯一责任在人的那一类：理由写清楚没有，"
+                  "决定它事后能不能被解释。")
+    else:
+        print("  没有任何拦截或人工放行。这不代表绝对安全，"
+              "只代表闸门没被触发过——内容质量仍需人判断。")
     return 0
 
 
@@ -808,6 +999,49 @@ def _rel(ts: float) -> str:
     return f"{int(d // 86400)} 天前"
 
 
+def _rel_left(ts: Optional[float]) -> str:
+    """还剩多久。和 _rel 分开写，因为"还剩 2 小时"和"2 小时前"是相反的
+    两件事，共用一个函数迟早会在某处把方向写反。"""
+    if not ts:
+        return "-"
+    d = float(ts) - time.time()
+    if d <= 0:
+        return "已过期（内容已清）"
+    if d < 60:
+        return f"{int(d)} 秒"
+    if d < 3600:
+        return f"{int(d // 60)} 分钟"
+    if d < 86400:
+        return f"{d / 3600:.1f} 小时"
+    return f"{int(d // 86400)} 天"
+
+
+def _print_hold(e: Any) -> int:
+    """被挂起时的说明。
+
+    这里唯一的重点是一句话：**对方什么都没收到**。
+    任何让人误以为"发出去了"的措辞，都会在几小时后变成
+    "我明明发了""我没收到"——而这正是这套投递语义想消灭的东西。
+    """
+    p = getattr(e, "pending", {}) or {}
+    pid = str(p.get("id") or "")
+    rules = ",".join(p.get("rules") or []) or "-"
+    print("⏸  没有发出：内容含敏感信息，已挂起等你决定。", file=sys.stderr)
+    if p.get("level"):
+        print(f"   密级判定 {p['level']}，命中规则 {rules}", file=sys.stderr)
+    if pid:
+        print(f"\n   审批件 {pid}", file=sys.stderr)
+        print(f"   看内容：a2alink approvals show {pid}", file=sys.stderr)
+        print(f"   批准发：a2alink approvals approve {pid} --reason \"为什么可以发\"",
+              file=sys.stderr)
+        print(f"   弃掉：  a2alink approvals deny {pid} --reason \"为什么不行\"",
+              file=sys.stderr)
+    else:
+        print("   挂起队列写入失败，这条只能作罢（原因已进审计）", file=sys.stderr)
+    print("\n   对方现在什么都没收到。别把「已挂起」当成「已发送」。", file=sys.stderr)
+    return 3
+
+
 def _name_map(c: AgentLink, limit: int = 500) -> Dict[str, str]:
     """agent_id → 给人看的名字。
 
@@ -901,22 +1135,34 @@ def _lookup(home: str, msg_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _resolve_target(to: str) -> str:
-    """把 ``@运维`` 这类本机会话别名翻成协议里的 agent 名。
+    """把 ``@运维`` / 共享标签 / 会话 ID 前缀翻成本机会话，再取协议身份。
 
-    别名只在本机有意义，注册中心不知道"运维"是谁。**先查别名再交给协议**，
-    是因为用户说"给运维发"时，他想的是那个对话，不是某个远端同名 Agent。
-    查不到就原样传下去，让 client.resolve 按名字/ID 去注册中心找。
+    别名只在本机有意义，注册中心不知道"运维"是谁。**先查本机再交给协议**，
+    是因为用户说"发给值班的人"时，他想的是本机那个对话，不是某个远端同名
+    Agent。查不到就原样传下去，让 client 按 ID 去注册中心找。
+
+    匹配顺序（别名 → 标签 → ID 前缀）写在 ``sessions.resolve`` 里，
+    这里不重复一套，避免两处规则慢慢走偏。
     """
     from . import sessions
     t = str(to or "").strip()
     bare = t[1:] if t.startswith("@") else t
     if not bare:
         return t
+    st = sessions.SessionStore()
     try:
-        rec = sessions.SessionStore().by_label(bare)
+        sid = st.resolve(bare)
+    except sessions.SessionError as e:
+        # 命中多个是输入不够具体，不是程序出错。转成 LinkError 让 main
+        # 统一打印一句人话，而不是甩一段 traceback 让人以为工具坏了。
+        raise LinkError("ambiguous_target", str(e))
     except (OSError, ValueError):
-        rec = None
-    return rec["agent_name"] if rec else bare
+        sid = None
+    if sid:
+        rec = st.get(sid)
+        if rec and rec.get("agent_name"):
+            return str(rec["agent_name"])
+    return bare
 
 
 def _print_received(items: List[Any], names: Dict[str, str]) -> None:
@@ -973,6 +1219,27 @@ def cmd_session(args: argparse.Namespace) -> int:
         print(f"   别人可以这样找你：a2alink say @{rec['label']} \"...\"")
         return 0
 
+    if action == "tag":
+        ident = _ident(args)
+        clearing = bool(getattr(args, "clear", False))
+        tags = [] if clearing else list(getattr(args, "tags", None) or [])
+        if not tags and not clearing:
+            print("❌ 至少给一个标签，或用 -c 清空", file=sys.stderr)
+            return 2
+        try:
+            rec = st.set_tags(ident.sid, tags)
+        except sessions.SessionError as e:
+            print(f"❌ {e}", file=sys.stderr)
+            return 2
+        if rec.get("tags"):
+            print(f"✅ 当前对话标签：{'、'.join(rec['tags'])}")
+            print("   标签是**可共享**的：多个对话可以都叫「值班」。"
+                  "所以按标签发消息只在它唯一时成立；"
+                  "有多个时系统会报歧义并列候选，不会替你挑。")
+        else:
+            print("✅ 标签已清空")
+        return 0
+
     if action == "release":
         ok = st.release_label(args.label)
         print(f"✅ 已释放别名 @{args.label}" if ok else f"（别名 @{args.label} 不存在）")
@@ -988,10 +1255,12 @@ def cmd_session(args: argparse.Namespace) -> int:
             cur = _ident(args).sid
         except Exception:
             pass
-        print(f"{'':2} {'别名':<12} {'协议身份':<16} {'最后活跃':<12} 会话 ID")
+        print(f"{'':2} {'别名':<12} {'标签':<16} {'协议身份':<16} {'最后活跃':<12} 会话 ID")
         for sid, r in sorted(rows.items(), key=lambda kv: -float(kv[1].get("last_seen") or 0)):
             mark = "→" if sid == cur else " "
+            tags = ",".join(r.get("tags") or []) or "-"
             print(f"{mark:2} {'@' + r['label'] if r.get('label') else '-':<12} "
+                  f"{tags:<16} "
                   f"{r.get('agent_name', ''):<16} "
                   f"{_rel(r.get('last_seen')):<12} {sid}")
         return 0
@@ -1148,6 +1417,8 @@ def cmd_say(args: argparse.Namespace) -> int:
         s = c.send(_resolve_target(args.to), payload, act=act, stage=args.stage,
                    conversation_id=args.conversation,
                    force=args.force, force_reason=args.reason)
+    except ApprovalRequired as e:
+        return _print_hold(e)
     except EgressBlocked as e:
         print(f"🚫 出站被拦：{e.message}", file=sys.stderr)
         _p(e.result.to_dict())
@@ -1183,6 +1454,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
         s = c.send(_resolve_target(args.to), payload, act="task", stage="open",
                    conversation_id=args.conversation,
                    force=args.force, force_reason=args.reason)
+    except ApprovalRequired as e:
+        return _print_hold(e)
     except EgressBlocked as e:
         print(f"🚫 出站被拦：{e.message}", file=sys.stderr)
         return 3
@@ -1278,6 +1551,8 @@ def cmd_reply(args: argparse.Namespace) -> int:
         s = c.send(to, payload, act="result", stage="done",
                    conversation_id=meta.get("conversation_id"),
                    in_reply_to=args.msg_id)
+    except ApprovalRequired as e:
+        return _print_hold(e)
     except EgressBlocked as e:
         print(f"🚫 出站被拦：{e.message}", file=sys.stderr)
         return 3
@@ -1365,8 +1640,10 @@ def cmd_peers(args: argparse.Namespace) -> int:
     for sid, r in sorted(local.items(), key=lambda kv: -float(kv[1].get("last_seen") or 0)):
         mark = "→" if sid == ident.sid else " "
         name = "@" + r["label"] if r.get("label") else "(未命名)"
+        tags = ",".join(r.get("tags") or [])
+        tail = f"  [{tags}]" if tags else ""
         print(f" {mark} {name:<12} {r.get('agent_name', ''):<16} "
-              f"最后活跃 {_rel(r.get('last_seen'))}")
+              f"最后活跃 {_rel(r.get('last_seen'))}{tail}")
 
     ids = {r.get("agent_name") for r in local.values()}
     try:
@@ -1415,6 +1692,184 @@ def cmd_fail(args: argparse.Namespace) -> int:
     elif out["requeued"]:
         print("↻ 已重新投递，下次 check 会再收到它。")
     return 0
+
+
+def _agent_home_by_name(agent_name: str) -> str:
+    """按协议身份反查本机 home。找不到返回空串。
+
+    为什么必须反查：批准命令的执行者未必在发起那条消息的对话里
+    （人可能开着另一个窗口在处理待办）。但消息必须**以原身份发出**，
+    否则对方看到的署名变了，"我确实说过这句话"就不成立了。
+    所以不能图省事用当前会话的身份重发。
+    """
+    from . import sessions
+    for _sid, r in sessions.SessionStore().all().items():
+        if r.get("agent_name") == agent_name:
+            return str(r.get("home") or "")
+    return ""
+
+
+def cmd_approvals(args: argparse.Namespace) -> int:
+    """待发内容的审批队列。"""
+    from .approvals import ApprovalError, ApprovalStore
+    from .client import AgentLink, LinkError
+    store = ApprovalStore()
+    action = args.action
+    as_json = bool(getattr(args, "json", False))
+
+    if action == "list":
+        rows = store.list(status=getattr(args, "status", None),
+                          limit=int(getattr(args, "limit", 100) or 100))
+        if as_json:
+            _p(rows)
+            return 0
+        if not rows:
+            print("（队列是空的）")
+            print("说明：被出站闸门拦下的消息会挂到这里等人决定，"
+                  "不会自己消失，也不会自己发出去。")
+            return 0
+        print(f"待批/历史（{len(rows)} 条，新的在前）")
+        for r in rows:
+            left = ""
+            if r.get("status") == "pending":
+                left = f"  剩 {_rel_left(r.get('expires_at'))}"
+            print(f"\n  {r['id']}  [{r['status']}]{left}")
+            print(f"    发给 {r['peer']}  act={r.get('act')} "
+                  f"域={r.get('scope')} 密级={r.get('level')}")
+            print(f"    命中规则：{','.join(r.get('rules') or []) or '-'}")
+            if r.get("status") == "pending":
+                print(f"    看内容：a2alink approvals show {r['id']}")
+        return 0
+
+    if action == "show":
+        pid = args.id
+        try:
+            meta, body = store.preview(pid, limit=int(getattr(args, "limit", 2000) or 2000))
+        except ApprovalError as e:
+            print(f"❌ {e}", file=sys.stderr)
+            return 2
+        if as_json:
+            _p({"meta": meta, "body": body})
+            return 0
+        print(f"审批件 {meta['id']}  状态 {meta['status']}")
+        print(f"发起者 {meta.get('requester')}（会话 {meta.get('session')}）")
+        print(f"收件人 {meta.get('peer')}  信任域 {meta.get('scope')}  "
+              f"密级 {meta.get('level')}")
+        print(f"命中规则：{','.join(meta.get('rules') or []) or '-'}"
+              f"（共 {meta.get('findings')} 处）")
+        print("-" * 60)
+        print(body)
+        print("-" * 60)
+        print("⚠️  上面是原文。它现在只在你的终端里，没有被写回磁盘。")
+        if meta.get("status") == "pending":
+            print(f"批准：a2alink approvals approve {pid} --reason \"为什么允许出域\"")
+            print(f"拒绝：a2alink approvals deny {pid} --reason \"为什么不允许\"")
+        return 0
+
+    if action == "approve":
+        pid = args.id
+        reason = str(args.reason or "").strip()
+        # 一律要求 --yes，不做"TTY 下免确认"的智能判断。
+        #
+        # 试过按 sys.stdin.isatty() 决定，结果在 Windows 的 Git Bash 里
+        # `< /dev/null` 被误判成终端，于是本该被拒的批准直接过了。
+        # 一个"有时要求、有时不要求"的确认，等于没有确认——更糟的是
+        # 它会让人以为自己被保护着。
+        #
+        # 这也不是防人：Agent 和你在同一个 shell 里，技术上无法区分。
+        # 能做的是让"替你批准了"一定出现在命令里、一定进审计，
+        # 把无声的动作变成留痕的动作。
+        if not getattr(args, "yes", False):
+            print("❌ 批准必须显式加 --yes。\n"
+                  "   这个动作会把内容送出组织边界，"
+                  "必须有一步是「我确认这件事由我决定」。\n"
+                  f"   确认要发就重跑：a2alink approvals approve {pid} "
+                  f"--reason \"...\" --yes", file=sys.stderr)
+            return 2
+        rec_by = "cli:" + (os.environ.get("USERNAME") or os.environ.get("USER") or "unknown")
+        try:
+            meta, payload = store.approve(pid, by=rec_by, reason=reason)
+        except ApprovalError as e:
+            print(f"❌ {e}", file=sys.stderr)
+            return 2
+
+        agent_name = str(meta.get("session") or "")
+        home = _agent_home_by_name(agent_name)
+        if not home:
+            print(f"⚠️  已批准，但找不到发起者的身份目录（{agent_name}），"
+                  f"无法以原身份重发。", file=sys.stderr)
+            print(f"   内容仍在队列里，可以回到原对话执行："
+                  f"a2alink say {meta.get('peer')} \"...\"", file=sys.stderr)
+            return 3
+        try:
+            c = AgentLink(registry=args.registry, name=agent_name, home=home)
+            # force_reason 要 >= 8 字：审批理由本身可能很短，
+            # 所以拼上审批件 ID——理由是"哪个审批件批准的"，
+            # 这比让人凑字数有意义。
+            sent = c.send(meta["peer"], payload, act=str(meta.get("act") or "task"),
+                          stage=str(meta.get("stage") or "open"),
+                          force=True,
+                          force_reason=f"审批件 {pid} 已批准：{reason}")
+        except (LinkError, Exception) as e:
+            print(f"⚠️  已批准，但发送失败：{e}", file=sys.stderr)
+            print("   状态会停在 approved——它和 sent 是两件事，"
+                  "别把'批准了'当成'发出去了'。", file=sys.stderr)
+            return 4
+        store.mark_sent(pid, sent.env.id)
+        # 批准这件事本身必须进审计链。send() 里的 egress.override 只说明了
+        # "有人放行"，没说是哪张审批件、谁批的、为什么——而这几项才是追责时
+        # 真正要回答的问题。
+        try:
+            c.audit.write("gate.approved", "note", "gate.approved",
+                          detail={"pending": pid, "approved_by": rec_by,
+                                  "reason": reason, "message_id": sent.env.id,
+                                  "peer": meta.get("peer")})
+        except Exception:
+            pass
+        print(f"✅ 已批准并发出：{sent.env.id}")
+        print(f"   审批件 {pid} → sent；批准理由：{reason}")
+        print(f"   ⚠️ 这条消息走的是「人已批准」通道，审计链里记了 approver。")
+        return 0
+
+    if action == "deny":
+        pid = args.id
+        deny_by = "cli:" + (os.environ.get("USERNAME") or os.environ.get("USER") or "unknown")
+        try:
+            rec = store.deny(pid, by=deny_by, reason=str(args.reason or "").strip())
+        except ApprovalError as e:
+            print(f"❌ {e}", file=sys.stderr)
+            return 2
+        # 拒绝同样要留痕。"我没批准"和"我根本没看到"是两件事，
+        # 只有写下来的才对得起这两种情况的区别。
+        home = _agent_home_by_name(str(rec.get("session") or ""))
+        if home:
+            try:
+                from .audit import AuditLog
+                AuditLog(os.path.join(home, "logs"), deny_by).write(
+                    "gate.denied", "note", "gate.denied",
+                    detail={"pending": pid, "denied_by": deny_by,
+                            "reason": rec.get("reason"),
+                            "peer": rec.get("peer")})
+            except Exception:
+                pass
+        print(f"🚫 已拒绝 {pid}，内容已销毁（不留副本）。")
+        print(f"   理由：{rec.get('reason') or '-'}")
+        return 0
+
+    if action == "stats":
+        s = store.stats()
+        _p(s) if as_json else None
+        if not as_json:
+            c = s["counts"]
+            print(f"待批 {c.get('pending',0)} · 已批准未发 {c.get('approved',0)} · "
+                  f"已发 {c.get('sent',0)} · 已拒 {c.get('denied',0)} · "
+                  f"过期 {c.get('expired',0)}")
+            if s.get("oldest_pending"):
+                print(f"最老的待批：{_rel(s['oldest_pending'])} 之前")
+        return 0
+
+    print(f"❌ 未知动作 {action}", file=sys.stderr)
+    return 2
 
 
 def cmd_inflight(args: argparse.Namespace) -> int:
@@ -1524,6 +1979,10 @@ def build_parser() -> argparse.ArgumentParser:
     srel.add_argument("label")
     srel.set_defaults(func=cmd_session)
     ses.add_parser("list", help="本机所有对话").set_defaults(func=cmd_session)
+    stag = ses.add_parser("tag", help="给当前对话打标签（可共享，如 值班/数据库）")
+    stag.add_argument("tags", nargs="*", help="标签，空格或逗号分隔；-c 清空")
+    stag.add_argument("-c", "--clear", action="store_true", help="清空所有标签")
+    stag.set_defaults(func=cmd_session)
     sfg = ses.add_parser("forget", help="从会话表移除（默认不删身份文件）")
     sfg.add_argument("who", nargs="?", default=None)
     sfg.add_argument("--drop-files", dest="drop_files", action="store_true",
@@ -1612,6 +2071,29 @@ def build_parser() -> argparse.ArgumentParser:
     inf = sub.add_parser("inflight", help="已读但没标完成的消息（可能掉地上的任务）")
     inf.add_argument("--limit", type=int, default=50)
     inf.set_defaults(func=cmd_inflight)
+
+    ap = sub.add_parser("approvals", help="被拦下的消息：看在队列里等谁批准")
+    aps = ap.add_subparsers(dest="action", required=True)
+    apl = aps.add_parser("list", help="列出待批与历史")
+    apl.add_argument("--status", default=None,
+                     choices=["pending", "approved", "sent", "denied", "expired"])
+    apl.add_argument("--limit", type=int, default=100)
+    apl.set_defaults(func=cmd_approvals)
+    apsh = aps.add_parser("show", help="解密看内容（只在终端里显示，不写回磁盘）")
+    apsh.add_argument("id")
+    apsh.add_argument("--limit", type=int, default=2000)
+    apsh.set_defaults(func=cmd_approvals)
+    apap = aps.add_parser("approve", help="批准并发出（必须给理由）")
+    apap.add_argument("id")
+    apap.add_argument("--reason", required=True, help="为什么允许它出域（会进审计）")
+    apap.add_argument("--yes", action="store_true",
+                      help="必须显式加：确认这条内容由你同意出域")
+    apap.set_defaults(func=cmd_approvals)
+    apdn = aps.add_parser("deny", help="拒绝并销毁内容")
+    apdn.add_argument("id")
+    apdn.add_argument("--reason", default="", help="为什么不许发")
+    apdn.set_defaults(func=cmd_approvals)
+    aps.add_parser("stats", help="队列概况").set_defaults(func=cmd_approvals)
 
     dq = sub.add_parser("dlq", help="死信队列：查看 / 重投 / 清理")
     dqs = dq.add_subparsers(dest="action", required=True)
@@ -1768,6 +2250,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     lgs.add_parser("verify", help="校验哈希链有没有断（能不能当证据）")
     lgs.add_parser("stats", help="按理由码统计")
+    lrp = lgs.add_parser("report", help="安全审计报告：人读摘要，离线可跑")
+    lrp.add_argument("--hours", type=float, default=24, help="时间窗口（小时），0=全部")
+    lrp.add_argument("--json", dest="as_json", action="store_true",
+                     help="机器可读输出")
 
     le = lgs.add_parser("export", help="导出为 JSONL，用于固定证据")
     le.add_argument("--out", default=None, help="输出文件，默认打到标准输出")

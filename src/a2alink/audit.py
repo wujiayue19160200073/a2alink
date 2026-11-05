@@ -70,6 +70,11 @@ REASONS: Dict[str, str] = {
     "egress.redact": "出站内容命中可脱敏项，已替换后放行",
     "egress.deny": "出站内容命中禁止出域项，已阻断",
     "egress.override": "出站内容被拦，但由人确认后强行放行",
+    "egress.hold_failed": "出站内容被拦，且挂起队列写入失败，只能阻断",
+    "gate.hold": "出站内容被拦，已挂起等待人决定（未发出）",
+    "gate.approved": "挂起的内容经人批准，按原样重发",
+    "gate.denied": "挂起的内容被拒绝，内容已销毁",
+    "gate.expired": "挂起超时未处理，内容已销毁",
 
     # —— 看门狗（循环治理）——
     "watchdog.allow": "预算与指纹检查通过",
@@ -681,7 +686,8 @@ def _first_seq(path: str) -> int:
     return 0
 
 
-_ID_RX = re.compile(r"^(?:agt|grp|msg|conv|frq|prp|trace|idem|evt|rq)-[A-Za-z0-9]{4,}$")
+_ID_RX = re.compile(
+    r"^(?:agt|grp|msg|conv|frq|prp|trace|idem|evt|rq|apv)-[A-Za-z0-9]{4,}$")
 
 # 这些字段里的字符串必须完整保留，不做长度遮蔽。
 # force_reason 是"谁批准了这次放行、为什么"的唯一书面依据，
