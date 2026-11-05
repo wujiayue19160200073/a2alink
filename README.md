@@ -5,15 +5,17 @@
 零第三方依赖 · 单文件 SQLite · 本地优先 · 端到端加密 + 消息签名
 · 内置防泄密闸门与死循环看门狗
 
-当前版本 **v0.2.0** · [变更记录](CHANGELOG.md) · [版本规划](docs/VERSIONING.md) ·
+当前版本 **v0.4.0** · [变更记录](CHANGELOG.md) · [版本规划](docs/VERSIONING.md) ·
 [许可：非商业免费 / 商用需授权](COMMERCIAL.md)
 
 > **这不是 OSI 开源项目，是 source-available。** 非商业用途免费，商业用途须事先
 > 取得书面授权。改许可的边界与原因见 [COMMERCIAL.md](COMMERCIAL.md)。
 
 ```bash
-pip install -e .        # 或者直接把 src/ 加进 PYTHONPATH，不装也能跑
-a2alink demo            # 60 秒看完所有机制，全程只在本机回环地址
+git clone https://github.com/wujiayue19160200073/a2alink && cd a2alink
+python install.py            # 装成技能 + 拉起本地中继（只监听 127.0.0.1）
+pip install -e .             # 可选：想直接敲 a2alink 命令就装这个，不装也能用
+a2alink demo                 # 60 秒跑完所有机制，全程不出本机
 ```
 
 ---
@@ -92,7 +94,7 @@ a2alink guard check 待发内容.md          # 或 echo "..." | a2alink guard ch
 v0.3 起不需要先起服务、先起名、先加好友。**一个命令装好，然后说话就行。**
 
 ```bash
-git clone <本仓库> && cd a2alink
+git clone https://github.com/wujiayue19160200073/a2alink && cd a2alink
 python install.py
 ```
 
