@@ -106,6 +106,22 @@ git push origin v0.5.0
 **标签一定要单独推**。`git push` 默认不带标签，
 忘了这一步的表现是"代码推上去了，但 Releases 里没有这个版本"。
 
+### 3.1 推镜像（Gitee / GitLab，可选）
+
+**顺序不能反**：先确认 GitHub 上的提交和 tag 是对的，再镜像出去。
+先推镜像后推 GitHub，等于让镜像短暂成为唯一真相。
+
+```bash
+python tools/mirror.py status   # 落后几个提交、tag 缺不缺、有没有人往镜像直推过
+python tools/mirror.py push     # 自检通过后逐个推 main 和 tags
+```
+
+`push` 会在推之前重跑一遍敏感文件检查，命中就**拒绝**（退出码 2）。
+它不会替你 `--force`：镜像漂移时先查原因——`--force` 抹掉的是别人的提交。
+
+平台怎么选、凭据怎么给（每平台一把单仓库部署公钥，而不是把 GitHub PAT
+存到另一个平台）、为什么 Codeberg 规则上不能放，见 [MIRRORS.md](MIRRORS.md)。
+
 ---
 
 ## 四、写 Release 说明

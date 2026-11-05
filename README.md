@@ -8,6 +8,10 @@
 当前版本 **v0.5.0** · [变更记录](CHANGELOG.md) · [版本规划](docs/VERSIONING.md) ·
 [许可：非商业免费 / 商用需授权](COMMERCIAL.md)
 
+**权威仓库：<https://github.com/wujiayue19160200073/a2alink>**
+Gitee / GitLab 上若有同名仓库，那是只读镜像，**可能落后于这里**；
+Issue、PR、安全报告只在这里受理（原因与镜像清单见 [docs/MIRRORS.md](docs/MIRRORS.md)）。
+
 > **这不是 OSI 开源项目，是 source-available。** 非商业用途免费，商业用途须事先
 > 取得书面授权。改许可的边界与原因见 [COMMERCIAL.md](COMMERCIAL.md)。
 
@@ -707,7 +711,9 @@ docs/           架构决策 / 线协议 / 通信架构调研 / 威胁模型 / �
 
 零第三方依赖，`PYTHONPATH=src python -m unittest discover -s tests` 即可验证。
 
-发布到 GitHub、每次发版的步骤与推送前自检，见 [`docs/RELEASING.md`](docs/RELEASING.md)。
+发布到 GitHub、每次发版的步骤与推送前自检，见 [`docs/RELEASING.md`](docs/RELEASING.md)；
+放到 Gitee / GitLab 等镜像、谁是权威仓库、为什么 Codeberg 不能放，见
+[`docs/MIRRORS.md`](docs/MIRRORS.md)。
 
 ---
 
