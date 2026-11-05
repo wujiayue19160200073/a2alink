@@ -662,6 +662,8 @@ docs/           架构决策 / 线协议 / 通信架构调研 / 威胁模型 / �
 
 零第三方依赖，`PYTHONPATH=src python -m unittest discover -s tests` 即可验证。
 
+发布到 GitHub、每次发版的步骤与推送前自检，见 [`docs/RELEASING.md`](docs/RELEASING.md)。
+
 ---
 
 ## 许可
