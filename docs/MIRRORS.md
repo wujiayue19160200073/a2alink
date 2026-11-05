@@ -145,6 +145,35 @@ git push gitee --tags
 - Gitee 会显示"贡献者/提交统计"，从 GitHub 推过去的历史不会有归属问题，
   但如果你在意，可以接受它是镜像这一事实。
 
+### 4.4 报 `Could not read from remote repository`
+
+这是建镜像第一次推送最常见的失败，而且报错信息具有误导性——它让你去查
+"仓库是否存在""权限对不对"，但真正的原因通常更简单。
+
+**判据：读得到、写不了。**
+
+```bash
+git ls-remote gitee; echo "exit=$?"     # exit=0 且无输出 = 空仓库，但读取成功
+git push gitee main                     # 报 Could not read from remote repository
+```
+
+两条一对比就能定性：
+
+| 现象 | 原因 |
+|---|---|
+| ls-remote 失败 + push 失败 | 仓库地址错 / key 没加 / 账号不对 |
+| **ls-remote 成功 + push 失败** | **部署公钥是只读的——添加时没勾「启用推送」** |
+
+Gitee 的部署公钥默认只读。添加后权限一般不能改，**删掉重新添加，勾上「启用推送」**。
+GitLab 的 Deploy Key 对应的是「Grant write permissions」复选框，同样默认不勾。
+
+再确认 key 到底有没有被接受：
+
+```bash
+GIT_SSH_COMMAND="ssh -v" git ls-remote gitee 2>&1 | grep -iE "server accepts|denied"
+# Server accepts key ← 认证没问题，问题在授权（权限），不在身份
+```
+
 ---
 
 ## 五、GitLab.com（可选）
