@@ -47,6 +47,8 @@ class TestSameMachineMesh(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown()
+        cls.srv.server_close()   # shutdown 不关监听 socket
+        cls.reg.close()          # 不关就靠 GC，测试跑多了会攒出 fd 泄漏
 
     def sess(self, name: str) -> AgentLink:
         """模拟"一个对话窗口"：独立 home、独立密钥、独立身份。"""
@@ -113,6 +115,8 @@ class TestNoMesh(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown()
+        cls.srv.server_close()   # shutdown 不关监听 socket
+        cls.reg.close()          # 不关就靠 GC，测试跑多了会攒出 fd 泄漏
 
     def test_strangers_blocked(self):
         os.environ["A2ALINK_QUIET"] = "1"
@@ -178,6 +182,8 @@ class TestAutostartHelpers(unittest.TestCase):
             self.assertIsNotNone(autostart.probe(url))
         finally:
             srv.shutdown()
+            srv.server_close()
+            reg.close()
 
     def test_ensure_does_not_touch_remote(self):
         out = autostart.ensure("https://not-exist.invalid")

@@ -36,8 +36,8 @@ class TestInstall(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(target, "SKILL.md")))
         self.assertTrue(os.path.isfile(
             os.path.join(target, "scripts", "a2a.py")))
-        marker = json.load(open(os.path.join(target, skillpack.MARKER),
-                                encoding="utf-8"))
+        with open(os.path.join(target, skillpack.MARKER), encoding="utf-8") as fh:
+            marker = json.load(fh)
         self.assertEqual(marker["name"], "a2alink")
         self.assertEqual(marker["version"], __version__)
         self.assertTrue(os.path.isdir(marker["src"]))
@@ -56,9 +56,8 @@ class TestInstall(unittest.TestCase):
         with self.assertRaises(skillpack.SkillPackError):
             skillpack.install(self.root)
         # 内容必须原样保留
-        self.assertEqual(
-            open(os.path.join(foreign, "SKILL.md"), encoding="utf-8").read(),
-            "我自己写的技能")
+        with open(os.path.join(foreign, "SKILL.md"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "我自己写的技能")
 
     def test_force_overrides(self):
         foreign = os.path.join(self.root, "a2alink")
@@ -66,8 +65,8 @@ class TestInstall(unittest.TestCase):
         with open(os.path.join(foreign, "SKILL.md"), "w", encoding="utf-8") as f:
             f.write("old")
         out = skillpack.install(self.root, force=True)
-        self.assertIn("a2alink", open(
-            os.path.join(out["target"], "SKILL.md"), encoding="utf-8").read())
+        with open(os.path.join(out["target"], "SKILL.md"), encoding="utf-8") as fh:
+            self.assertIn("a2alink", fh.read())
 
     def test_uninstall_keeps_identity(self):
         skillpack.install(self.root)
@@ -114,7 +113,8 @@ class TestLauncherRuns(unittest.TestCase):
     def test_reports_missing_src_clearly(self):
         # 模拟"仓库被搬走"：把写死的路径换成一个不存在的目录。
         # 期望的不是崩溃，而是一句能让人知道下一步做什么的话。
-        text = open(self.launcher, encoding="utf-8").read()
+        with open(self.launcher, encoding="utf-8") as fh:
+            text = fh.read()
         broken = os.path.join(self.root, "broken.py")
         with open(broken, "w", encoding="utf-8") as f:
             f.write(text.replace(repr(skillpack.package_src_root()),

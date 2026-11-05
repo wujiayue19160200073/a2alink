@@ -133,6 +133,23 @@ REASONS: Dict[str, str] = {
     # 事后必须能回答"它凭什么发得出去"，所以放行也要有理由码。
     "mesh.local_trust": "同一台机器上的会话互发消息，按 local_mesh 免好友审批放行",
     "mesh.deny_friends": "非同好友且未开启同机互信，消息被拒",
+
+    # —— 可靠投递（v0.4.0）——
+    # 这一组的存在本身就是一次纠错：以前"读了"和"做完了"是一件事，
+    # 于是任务失败在日志里**不留痕迹**。现在失败是一个必须被写下来的事件。
+    "msg.done": "收件方声明这条消息已处理完",
+    "msg.fail": "收件方上报处理失败，按策略重投",
+    "msg.dead": "重投次数用尽，消息进入死信队列（不是被安全策略拦下的）",
+    "msg.requeue": "死信被人工重新投递，重投次数归零",
+    "msg.purge": "死信被人工清理（只标记，不删行）",
+
+    # —— 遗嘱消息（v0.4.0）——
+    # Agent 崩溃最恶劣的后果不是报错，是**静默消失**：任务在它手上，
+    # 没人知道它已经不在了。遗嘱就是让"我不在了"这件事也能被投递。
+    "will.set": "设置或更新遗嘱消息",
+    "will.clear": "清除遗嘱消息",
+    "will.fired": "检测到掉线超时，代发遗嘱消息",
+    "will.skip": "掉线但遗嘱未投递（已过期、已发过或目标非法）",
 }
 
 # 哪些结果算"被挡下来了"，用于统计与告警。
@@ -615,7 +632,8 @@ class AuditLog:
         for p in self._all_files():
             if os.path.dirname(p) != self.root:
                 continue
-            data = open(p, "rb").read()
+            with open(p, "rb") as fh:
+                data = fh.read()
             n = data.count(b"\n")
             files.append({"name": os.path.basename(p),
                           "sha256": hashlib.sha256(data).hexdigest(),

@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import re
 import time
 import uuid
@@ -51,12 +52,22 @@ TERMINAL_STAGES = (STAGE_DONE, STAGE_HANDOFF, STAGE_NEED_HUMAN, STAGE_BLOCKED)
 
 MAX_HOPS_HARD_LIMIT = 16
 MAX_ENVELOPE_BYTES = 64 * 1024
+# 回复链最多记这么多条。抄的是 SMTP 的 References 头，但加了一道收口：
+# 链是**无界增长**的（A 问 B、B 问 C、C 问 D……），照原样累积下去，
+# 一百轮转手就能把信封撑到超过 MAX_ENVELOPE_BYTES，那时候报的错会是
+# "信封超长"，没人想得到根因是"回复链太长"。
+MAX_REFERENCES = 8
 
 _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 
 
 class ProtocolError(ValueError):
     """信封格式非法。上层应视为攻击面，按不可信输入处理。"""
+
+
+def _reject_constant(name: str):
+    """给 json.loads 的 parse_constant 用：遇到 NaN/Infinity 直接拒绝。"""
+    raise ProtocolError(f"JSON 里不允许出现 {name}（非标准字面量）")
 
 
 def new_id(prefix: str = "") -> str:
@@ -130,6 +141,11 @@ class Envelope:
     ttl_hops: int
     stage: str = STAGE_OPEN
     in_reply_to: Optional[str] = None
+    # 整条回复链（SMTP References 的消息版）。in_reply_to 只说"我回的是谁"，
+    # 转手两次之后就没人答得上来"最初问的是什么、中间谁改了措辞"。
+    # ⚠️ 它参与签名，但**为空时不出现在 to_dict 里**——这样 0.4 之前的
+    # 信封规范字节完全不变，历史消息照样能验签（见 canonical_bytes）。
+    references: List[str] = field(default_factory=list)
     correlation_id: Optional[str] = None
     idempotency_key: Optional[str] = None
     budget: Budget = field(default_factory=Budget)
@@ -146,7 +162,7 @@ class Envelope:
 
     # ---------------- 序列化 ----------------
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "v": self.v,
             "id": self.id,
             "from": self.from_agent,
@@ -168,6 +184,12 @@ class Envelope:
             "enc": self.enc,
             "signature": self.signature,
         }
+        # 空链**不落字段**。这不是省字节，是兼容性：canonical_bytes 直接
+        # 序列化 to_dict()，多一个 "references": [] 就会让所有 0.3 信封的
+        # 签名校验失败——一次"加功能"变成"历史消息全部不认"。
+        if self.references:
+            d["references"] = list(self.references)
+        return d
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, separators=(",", ":"))
@@ -199,6 +221,19 @@ class Envelope:
         }
         return b"a2alink/v1/aad\x00" + json.dumps(
             head, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    @staticmethod
+    def references_for(parent: "Envelope") -> List[str]:
+        """给"回复 parent 的新消息"算 references。
+
+        SMTP 是整条链全带。这里留**第一条 + 最近 N-1 条**：
+        第一条是最初那个问题（排查时最想知道"从哪开始的"），中间那些
+        转手记录在信封体积面前只能舍——但舍中间，不舍两头。
+        """
+        chain = list(parent.references) + [parent.id]
+        if len(chain) > MAX_REFERENCES:
+            chain = [chain[0]] + chain[-(MAX_REFERENCES - 1):]
+        return chain
 
     def fingerprint(self) -> str:
         return hashlib.sha256(self.canonical_bytes()).hexdigest()[:16]
@@ -309,6 +344,8 @@ class Envelope:
             payload=payload,
             conversation_id=self.conversation_id,
             in_reply_to=self.id,
+            # 默认把"我"接进链里；转发场景可以显式传 references 覆盖。
+            references=kw.pop("references", None) or self.references_for(self),
             correlation_id=self.correlation_id or self.id,
             idempotency_key=new_id("idem-"),
             created_at=time.time(),
@@ -389,6 +426,11 @@ class Envelope:
             v = d.get(k)
             if not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0:
                 raise ProtocolError(f"{k} 必须是正数")
+            # JSON 标准里没有 Infinity/NaN，但 Python 的 json.loads **默认接受**
+            # 它们（parse_constant）。不挡住的话，`"expires_at": Infinity`
+            # 会让 expired() 永远返回 False —— 一条消息可以被无限期重放。
+            if not math.isfinite(v):
+                raise ProtocolError(f"{k} 必须是有限数（收到 {v!r}）")
             return float(v)
 
         ttl = d.get("ttl_hops")
@@ -396,6 +438,31 @@ class Envelope:
             raise ProtocolError("ttl_hops 必须是非负整数")
         if ttl > MAX_HOPS_HARD_LIMIT:
             raise ProtocolError(f"ttl_hops 超过硬上限 {MAX_HOPS_HARD_LIMIT}")
+
+        # capabilities 必须是字符串数组。以前是 `list(d.get(...) or [])`，
+        # 于是 `"hack"` 会变成 ['h','a','c','k'] 静默通过——校验看着在做，
+        # 实际做的是"把非法输入改造成合法输入"。
+        caps_raw = d.get("capabilities")
+        if caps_raw is None:
+            caps_raw = []
+        if not isinstance(caps_raw, list) or not all(isinstance(c, str) for c in caps_raw):
+            raise ProtocolError("capabilities 必须是字符串数组")
+        if len(caps_raw) > 64:
+            raise ProtocolError("capabilities 条数过多")
+
+        # 回复链：来源不可信，必须当外部输入校验。这里不做"超了就截断"的
+        # 宽容处理——截断会把一条被篡改的链伪装成合法链，而排查时正是靠
+        # 链的完整性判断"中间谁插过一手"。
+        refs_raw = d.get("references")
+        if refs_raw is None:
+            refs_raw = []
+        if not isinstance(refs_raw, list) or not all(isinstance(r, str) for r in refs_raw):
+            raise ProtocolError("references 必须是字符串数组")
+        if len(refs_raw) > MAX_REFERENCES:
+            raise ProtocolError(f"references 超过 {MAX_REFERENCES} 条上限")
+        for r in refs_raw:
+            if not r.strip() or len(r) > 256:
+                raise ProtocolError("references 里有空串或超长 ID")
 
         env = Envelope(
             id=need_str("id"),
@@ -410,10 +477,11 @@ class Envelope:
             ttl_hops=ttl,
             stage=stage,
             in_reply_to=d.get("in_reply_to"),
+            references=list(refs_raw),
             correlation_id=d.get("correlation_id"),
             idempotency_key=d.get("idempotency_key"),
             budget=Budget.from_dict(d.get("budget")),
-            capabilities=list(d.get("capabilities") or []),
+            capabilities=list(caps_raw),
             trace_id=d.get("trace_id"),
             signature=d.get("signature"),
             pub=pub,
@@ -431,9 +499,17 @@ class Envelope:
     @staticmethod
     def from_json(s: str) -> "Envelope":
         try:
-            d = json.loads(s)
+            # parse_constant 挡住 Infinity / -Infinity / NaN：
+            # 标准 JSON 没有这三个字面量，但 Python 默认会把它们解析成 float。
+            # 一条 expires_at=Infinity 的信封能永久绕过 TTL —— 见 need_num 的注释。
+            d = json.loads(s, parse_constant=_reject_constant)
         except json.JSONDecodeError as e:
             raise ProtocolError(f"JSON 解析失败: {e}") from e
+        except RecursionError as e:
+            # 深度嵌套（例如 3000 层 `[`）在 json 解码阶段就会撞到 Python
+            # 递归上限。这不是"格式错误"而是"输入太恶意"，但两者对调用方
+            # 的处理方式相同：拒绝这条消息。绝不能让它逃逸成进程级崩溃。
+            raise ProtocolError("JSON 嵌套层数过深") from e
         return Envelope.from_dict(d)
 
 

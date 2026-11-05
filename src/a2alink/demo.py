@@ -197,6 +197,7 @@ def run_demo() -> int:
     print(COMPLIANCE_CHECKLIST)
 
     srv.shutdown()
+    reg.close()
     print(f"\n演示结束。所有数据在 {tmp}（临时目录，可删）。")
     print("下一步：a2alink registry  然后  a2alink doctor")
     return 0

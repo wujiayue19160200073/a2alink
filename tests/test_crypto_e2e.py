@@ -52,6 +52,8 @@ class CryptoBase(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown()
+        cls.srv.server_close()   # shutdown 不关监听 socket
+        cls.reg.close()          # 不关就靠 GC，测试跑多了会攒出 fd 泄漏
 
     def client(self, name, **kw):
         return AgentLink(registry=self.url, name=name,

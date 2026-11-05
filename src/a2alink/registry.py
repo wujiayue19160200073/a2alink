@@ -173,7 +173,8 @@ class Registry:
                  invite_code: Optional[str] = None,
                  audit_enabled: bool = True,
                  require_signature: bool = True,
-                 local_mesh: bool = False) -> None:
+                 local_mesh: bool = False,
+                 max_attempts: int = 3) -> None:
         self.db_path = db_path
         d = os.path.dirname(os.path.abspath(db_path))
         if d:
@@ -191,6 +192,9 @@ class Registry:
         # 默认要求签名。老部署要平滑迁移可临时设 False，
         # 但那样等于放弃"服务端这一层防冒充"，不是长期选项。
         self.require_signature = bool(require_signature)
+        # 一条消息重投几次就判死信。默认 3：和 RabbitMQ 的常见配置一致，
+        # 也符合"事不过三"——第四次还失败，多半不是抖动，是真坏了。
+        self.max_attempts = max(1, int(max_attempts))
         # 同机互信：同一个 OS 用户下的多个对话，互发消息不要求先加好友。
         #
         # 这不是"开后门"，理由是本来就没有门：同一个 OS 用户能读
@@ -210,6 +214,32 @@ class Registry:
         self.audit_chain = AuditLog(
             os.path.join(d, "logs") if d else "logs", "service:registry",
             preview_chars=0, enabled=audit_enabled)
+
+    # ---------------------------------------------------------------- 生命周期
+    def close(self) -> None:
+        """关掉 sqlite 连接。可重复调用。
+
+        为什么必须有：`sqlite3.connect` 持有文件句柄，不关就等 GC；
+        CPython 的 GC 不保证及时，测试里频繁建实例会攒出满屏
+        `ResourceWarning: unclosed database`，常驻进程里就是 fd 泄漏。
+        连接已经断了再关一次不报错 —— 调用方（比如 finally 里）不用自己判状态。
+        """
+        conn = getattr(self, "conn", None)
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except sqlite3.ProgrammingError:
+            pass          # 已经关了，或者被别的线程关了
+        finally:
+            self.conn = None
+
+    def __enter__(self) -> "Registry":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
 
     # 老库升级：v0.1.1 给 proposals/groups 加了字段，直接 ALTER 补上，
     # 不搞"删库重建"——那是在教用户丢数据。
@@ -234,6 +264,25 @@ class Registry:
         ("agents", "kex_pub", "TEXT DEFAULT ''"),
         ("agents", "key_fp", "TEXT DEFAULT ''"),
         ("agents", "key_rotated_at", "REAL"),
+        # ---- v0.4.0 可靠投递 ----
+        # 以前 `ack` 一拍两散：读了就当地处理完了。Agent 读完崩掉，
+        # 任务就永久消失，而且审计链上看不出丢的是哪一条——
+        # 因为压根没有"这条还没做完"这个事实被记下来过。
+        # 现在把两个事实分开存：state=投递位点，done_at=处理完成。
+        ("messages", "attempts", "INTEGER DEFAULT 0"),
+        ("deliveries", "done_at", "REAL"),
+        ("deliveries", "fail_reason", "TEXT DEFAULT ''"),
+        # dead: 0=正常 1=死信 2=已人工清理。用整数而不是删行，
+        # 是因为"这条被我扔了"本身也是要能查的事。
+        ("deliveries", "dead", "INTEGER DEFAULT 0"),
+        # ---- v0.4.0 遗嘱 ----
+        # 存的是**客户端预先签好**的整条信封，不是一段文本。
+        # 注册中心没有私钥，它代发时必须能原样交出一条验得过签的信；
+        # 否则就得为遗嘱开一个"不验签"的降级口子，那个口子迟早被用来伪造。
+        ("agents", "will", "TEXT DEFAULT ''"),
+        ("agents", "will_ttl", "REAL DEFAULT 0"),
+        ("agents", "will_fired", "INTEGER DEFAULT 0"),
+        ("agents", "will_set_at", "REAL"),
     )
 
     def _migrate(self) -> None:
@@ -1068,6 +1117,245 @@ class Registry:
                       " AND state='pending'", (me, cursor))
         return {"acked": cur.rowcount or 0, "cursor": cursor}
 
+    # ------------------------------------------------------------------
+    # 可靠投递：把"已读"和"已处理完"拆成两个事实
+    # ------------------------------------------------------------------
+    # 为什么值得单独做一层：MQ 里 ack 是"消费成功"，IM 里"已读"是"人看见了"。
+    # Agent 两者都不是——它读完可能崩、可能转手、可能发现自己做不了。
+    # 把这三件事都塞进一个 ack，结果就是"任务消失了，但日志上一切正常"。
+    def done(self, me: str, message_ids: List[str]) -> Dict[str, Any]:
+        """标记"这件事我做完了"。"""
+        ids = [str(i).strip() for i in (message_ids or []) if str(i).strip()]
+        if not ids:
+            return {"done": 0}
+        marks = ",".join("?" * len(ids))
+        # 每条消息只标它**最近一次**投递。一条消息重投过三次就有三条
+        # delivery，全标一遍会让"完成 1 件事"显示成"完成 3 件"。
+        cur = self._x(
+            f"""UPDATE deliveries SET done_at=?
+                WHERE recipient=? AND done_at IS NULL
+                  AND seq IN (SELECT MAX(seq) FROM deliveries
+                              WHERE recipient=? AND message_seq IN
+                                (SELECT seq FROM messages WHERE id IN ({marks}))
+                              GROUP BY message_seq)""",
+            (time.time(), me, me, *ids))
+        n = cur.rowcount or 0
+        self.audit(me, "msg.done", f"标记完成 {n} 条", reason="msg.done",
+                   extra={"count": n, "ids": ids[:20]})
+        return {"done": n}
+
+    def fail(self, me: str, message_id: str, reason: str = "",
+             requeue: bool = True) -> Dict[str, Any]:
+        """上报"这条我处理不了"。按策略重投，或判死信。
+
+        重投**新建一条 delivery**，而不是把旧行改回 pending：cursor 是单调
+        递增的投递位点，把它倒退回去会让已经读过的消息重新涌进来。新建一行
+        既能重投、又不破坏位点单调。代价是同一 message_id 会有多条 delivery
+        记录——但那本来就是事实，应该看得见"这条投过三次"。
+        """
+        rid = str(message_id or "").strip()
+        if not rid:
+            raise RegistryError("bad_request", "缺少 message_id")
+        rows = self._q("SELECT seq FROM messages WHERE id=?", (rid,))
+        if not rows:
+            raise RegistryError("not_found", "消息不存在", 404)
+        mseq = rows[0]["seq"]
+        own = self._q("SELECT seq FROM deliveries WHERE message_seq=? AND recipient=?"
+                      " ORDER BY seq DESC LIMIT 1", (mseq, me))
+        if not own:
+            # 不能只凭 message_id 就改状态：那等于让人拿别人的消息 ID
+            # 去填自己的失败计数，甚至把别人的消息推进死信队列。
+            raise RegistryError("forbidden", "这条消息没有投递给你", 403)
+
+        self._x("UPDATE messages SET attempts=COALESCE(attempts,0)+1 WHERE seq=?", (mseq,))
+        att = int(self._q("SELECT COALESCE(attempts,0) AS a FROM messages WHERE seq=?",
+                          (mseq,))[0]["a"])
+        # 只动**最近一次**投递记录。按 message_seq 批量改会把历史投递
+        # 一起标成死信，DLQ 里就会出现"一条消息三条记录"的假象。
+        latest = int(self._q("SELECT COALESCE(MAX(seq),0) AS s FROM deliveries"
+                             " WHERE message_seq=? AND recipient=?",
+                             (mseq, me))[0]["s"] or 0)
+        text = str(reason or "")[:200]
+        self._x("UPDATE deliveries SET fail_reason=? WHERE seq=?", (text, latest))
+
+        out: Dict[str, Any] = {"message_id": rid, "attempts": att,
+                               "max_attempts": self.max_attempts,
+                               "dead": False, "requeued": False, "delivery_seq": 0}
+        if att >= self.max_attempts:
+            self._x("UPDATE deliveries SET dead=1 WHERE seq=?", (latest,))
+            out["dead"] = True
+            self.audit(me, "msg.dead", f"进入死信 attempts={att}", reason="msg.dead",
+                       extra={"message_id": rid, "attempts": att, "reason": text})
+            return out
+
+        if requeue:
+            cur = self._x("INSERT INTO deliveries(message_seq, recipient, state, created_at)"
+                          " VALUES(?,?,'pending',?)", (mseq, me, time.time()))
+            out["requeued"] = True
+            out["delivery_seq"] = int(cur.lastrowid or 0)
+        self.audit(me, "msg.fail", f"处理失败 attempts={att}", reason="msg.fail",
+                   extra={"message_id": rid, "attempts": att,
+                          "requeued": out["requeued"], "reason": text})
+        return out
+
+    def inflight(self, me: str, limit: int = 50) -> Dict[str, Any]:
+        """已读但没标完成的。这张表就是"可能掉在地上的任务"清单。
+
+        只看每条消息**最近一次**投递：重投三次就有三条 delivery 记录，
+        但它们说的是同一件事，全列出来会把"1 个未完成任务"说成"3 个"。
+        """
+        rows = self._q(
+            """SELECT d.seq AS delivery_seq, m.id, m.from_agent, m.conversation_id,
+                      m.created_at, COALESCE(m.attempts,0) AS attempts, d.fail_reason
+               FROM deliveries d JOIN messages m ON m.seq=d.message_seq
+               WHERE d.recipient=? AND d.state='acked'
+                 AND d.done_at IS NULL AND COALESCE(d.dead,0)=0
+                 AND d.seq = (SELECT MAX(d2.seq) FROM deliveries d2
+                              WHERE d2.message_seq=d.message_seq AND d2.recipient=d.recipient)
+               ORDER BY d.seq DESC LIMIT ?""",
+            (me, max(1, min(500, int(limit)))))
+        return {"items": [dict(r) for r in rows], "count": len(rows)}
+
+    # ------------------------------------------------------------------
+    # 死信队列
+    # ------------------------------------------------------------------
+    def dlq(self, me: str, limit: int = 50) -> Dict[str, Any]:
+        rows = self._q(
+            """SELECT d.seq AS delivery_seq, m.id, m.from_agent, m.to_type, m.to_id,
+                      m.created_at, COALESCE(m.attempts,0) AS attempts, d.fail_reason
+               FROM deliveries d JOIN messages m ON m.seq=d.message_seq
+               WHERE d.recipient=? AND COALESCE(d.dead,0)=1
+               ORDER BY d.seq DESC LIMIT ?""",
+            (me, max(1, min(500, int(limit)))))
+        return {"items": [dict(r) for r in rows], "count": len(rows)}
+
+    def dlq_requeue(self, me: str, message_id: str) -> Dict[str, Any]:
+        rid = str(message_id or "").strip()
+        rows = self._q("SELECT seq FROM messages WHERE id=?", (rid,))
+        if not rows:
+            raise RegistryError("not_found", "消息不存在", 404)
+        mseq = rows[0]["seq"]
+        if not self._q("SELECT seq FROM deliveries WHERE message_seq=? AND recipient=?"
+                       " AND COALESCE(dead,0)=1", (mseq, me)):
+            raise RegistryError("not_found", "这条消息不在你的死信队列里", 404)
+        # 重投等于重新给一次机会：次数归零，否则一次 requeue 会立刻又判死。
+        self._x("UPDATE messages SET attempts=0 WHERE seq=?", (mseq,))
+        # 只复活 dead=1（死信）。dead=2 是已被人工清理的，重投它等于
+        # 绕过了"我确认丢掉"这个决定——那一步必须有意为之，不能顺手发生。
+        self._x("UPDATE deliveries SET dead=0 WHERE message_seq=? AND recipient=?"
+                " AND COALESCE(dead,0)=1", (mseq, me))
+        cur = self._x("INSERT INTO deliveries(message_seq, recipient, state, created_at)"
+                      " VALUES(?,?,'pending',?)", (mseq, me, time.time()))
+        self.audit(me, "msg.requeue", "死信重投", reason="msg.requeue",
+                   extra={"message_id": rid})
+        return {"message_id": rid, "requeued": True,
+                "delivery_seq": int(cur.lastrowid or 0)}
+
+    def dlq_purge(self, me: str, message_id: str = "") -> Dict[str, Any]:
+        """清理死信。只标 dead=2，不删行——"我扔了这条"本身也要能查。"""
+        rid = str(message_id or "").strip()
+        if rid:
+            rows = self._q("SELECT seq FROM messages WHERE id=?", (rid,))
+            if not rows:
+                raise RegistryError("not_found", "消息不存在", 404)
+            cur = self._x("UPDATE deliveries SET dead=2 WHERE message_seq=? AND recipient=?"
+                          " AND COALESCE(dead,0)=1", (rows[0]["seq"], me))
+        else:
+            cur = self._x("UPDATE deliveries SET dead=2 WHERE recipient=?"
+                          " AND COALESCE(dead,0)=1", (me,))
+        n = cur.rowcount or 0
+        self.audit(me, "msg.purge", f"清理死信 {n} 条", reason="msg.purge",
+                   extra={"count": n, "message_id": rid})
+        return {"purged": n}
+
+    # ------------------------------------------------------------------
+    # 遗嘱消息（Last Will）
+    # ------------------------------------------------------------------
+    # 为什么要有这个：Agent 崩溃最坏的后果不是报错，是**静默消失**。
+    # 任务在它手上，对方还在等，而没有人知道它已经不在了。
+    # 报错至少有人看见，静默消失连"该重试"这个念头都不会产生。
+    DEFAULT_WILL_TTL = 600.0
+
+    def set_will(self, me: str, env: Envelope, ttl_seconds: float = 0) -> Dict[str, Any]:
+        """保存遗嘱：客户端先签好，注册中心只保管、只代发。
+
+        ⚠️ 这里有一条不能绕的约束：注册中心没有私钥。
+        如果让它"掉线时替 Agent 生成一条消息"，那条消息必然签不出有效签名，
+        接收方按规矩就该拒收；而为了让它能收下，就得开一个"遗嘱不验签"的
+        降级口子——那个口子一旦存在，伪造遗嘱只需要会调接口。
+        "保管一封已经签好的信"是唯一不破坏这个承诺的做法。
+        """
+        if env.from_agent != me:
+            raise RegistryError("forbidden", "遗嘱信封的 from 必须是本人", 403)
+        self._verify_envelope(me, env)
+        ttl = float(ttl_seconds or self.DEFAULT_WILL_TTL)
+        if not (30.0 <= ttl <= 86400.0):
+            raise RegistryError("bad_request", "will_ttl 必须在 30~86400 秒之间", 400)
+        self._x("UPDATE agents SET will=?, will_ttl=?, will_fired=0, will_set_at=?"
+                " WHERE id=?", (env.to_json(), ttl, time.time(), me))
+        self.audit(me, "will.set", f"ttl={int(ttl)}s", reason="will.set",
+                   extra={"to": env.to_id, "to_type": env.to_type, "id": env.id})
+        return {"will": True, "ttl_seconds": ttl, "to": env.to_id,
+                "deliver_after": int(ttl)}
+
+    def clear_will(self, me: str) -> Dict[str, Any]:
+        self._x("UPDATE agents SET will='', will_ttl=0, will_fired=0 WHERE id=?", (me,))
+        self.audit(me, "will.clear", "清除遗嘱", reason="will.clear")
+        return {"will": False}
+
+    def will_info(self, me: str) -> Dict[str, Any]:
+        rows = self._q("SELECT will, will_ttl, will_fired, will_set_at, last_seen"
+                       " FROM agents WHERE id=?", (me,))
+        if not rows:
+            return {"will": False}
+        r = rows[0]
+        if not r["will"]:
+            return {"will": False}
+        try:
+            env = Envelope.from_json(r["will"])
+            to_id, mid = env.to_id, env.id
+        except Exception:
+            to_id, mid = "", ""
+        return {"will": True, "to": to_id, "message_id": mid,
+                "ttl_seconds": r["will_ttl"], "fired": bool(r["will_fired"]),
+                "last_seen": r["last_seen"]}
+
+    def sweep_wills(self, now: Optional[float] = None) -> List[Dict[str, Any]]:
+        """扫一遍掉线的 Agent，代发遗嘱。
+
+        抽成独立方法而不是只藏在后台线程里：定时任务最难测，抽出来之后
+        测试可以直接把 now 拨到未来，不用 sleep 等人。
+        """
+        now = float(now if now is not None else time.time())
+        rows = self._q("SELECT id, will, will_ttl, last_seen FROM agents"
+                       " WHERE status='active' AND will!='' AND COALESCE(will_fired,0)=0")
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            ttl = float(r["will_ttl"] or 0)
+            if ttl <= 0 or (now - float(r["last_seen"] or 0)) < ttl:
+                continue
+            aid = r["id"]
+            # 先落标记再投递：投递失败时不能让下一轮无限重试，
+            # 那是"遗嘱把自己变成消息风暴"的经典事故。
+            self._x("UPDATE agents SET will_fired=1 WHERE id=?", (aid,))
+            try:
+                env = Envelope.from_json(r["will"])
+                if env.expired(now):
+                    self.audit(aid, "will.skip", "遗嘱信封已过期", reason="will.skip",
+                               extra={"why": "expired", "id": env.id})
+                    out.append({"agent": aid, "fired": False, "why": "expired"})
+                    continue
+                self.send(aid, env)
+                self.audit(aid, "will.fired", f"to={env.to_id}", reason="will.fired",
+                           trace=env.trace_id, extra={"to": env.to_id, "id": env.id})
+                out.append({"agent": aid, "fired": True, "message_id": env.id,
+                            "to": env.to_id})
+            except Exception as e:
+                self.audit(aid, "will.skip", f"{type(e).__name__}: {e}"[:200],
+                           reason="will.skip", extra={"why": type(e).__name__})
+                out.append({"agent": aid, "fired": False, "why": str(e)[:120]})
+        return out
+
     def trace_view(self, trace: str, limit: int = 500) -> Dict[str, Any]:
         """按 trace_id 还原服务端这一侧的时间线。
 
@@ -1192,6 +1480,9 @@ class _Handler(BaseHTTPRequestHandler):
         ("GET", r"^/v1/stats$", "h_stats"),
         ("POST", r"^/v1/agents/register$", "h_register"),
         ("PUT", r"^/v1/agents/me/keys$", "h_my_keys"),
+        ("PUT", r"^/v1/agents/me/will$", "h_set_will"),
+        ("GET", r"^/v1/agents/me/will$", "h_get_will"),
+        ("DELETE", r"^/v1/agents/me/will$", "h_clear_will"),
         ("GET", r"^/v1/agents$", "h_discover"),
         ("GET", r"^/v1/agents/(?P<aid>[A-Za-z0-9\-_]+)$", "h_agent"),
         ("POST", r"^/v1/friends/requests$", "h_friend_req"),
@@ -1211,6 +1502,12 @@ class _Handler(BaseHTTPRequestHandler):
         ("POST", r"^/v1/messages$", "h_send"),
         ("GET", r"^/v1/inbox$", "h_inbox"),
         ("POST", r"^/v1/inbox/ack$", "h_ack"),
+        ("POST", r"^/v1/inbox/done$", "h_done"),
+        ("POST", r"^/v1/inbox/fail$", "h_fail"),
+        ("GET", r"^/v1/inbox/inflight$", "h_inflight"),
+        ("GET", r"^/v1/dlq$", "h_dlq"),
+        ("POST", r"^/v1/dlq/requeue$", "h_dlq_requeue"),
+        ("POST", r"^/v1/dlq/purge$", "h_dlq_purge"),
         ("GET", r"^/v1/audit$", "h_audit"),
         ("GET", r"^/v1/trace/(?P<tid>[A-Za-z0-9\-_]+)$", "h_trace"),
     ]
@@ -1407,6 +1704,70 @@ class _Handler(BaseHTTPRequestHandler):
         d = self._body()
         self._send(200, self.registry.ack(me["id"], int(d.get("cursor", 0) or 0)))
 
+    def h_done(self, a, q) -> None:
+        me = self._me()
+        d = self._body()
+        ids = d.get("message_ids")
+        if ids is None:
+            mid = d.get("message_id")
+            ids = [mid] if mid else []
+        if not isinstance(ids, list):
+            self._err(400, "bad_request", "message_ids 必须是数组")
+            return
+        self._send(200, self.registry.done(me["id"], [str(x) for x in ids]))
+
+    def h_fail(self, a, q) -> None:
+        me = self._me()
+        d = self._body()
+        mid = d.get("message_id")
+        if not mid:
+            self._err(400, "bad_request", "缺少 message_id")
+            return
+        self._send(200, self.registry.fail(
+            me["id"], str(mid), str(d.get("reason") or ""),
+            requeue=bool(d.get("requeue", True))))
+
+    def h_inflight(self, a, q) -> None:
+        me = self._me()
+        self._send(200, self.registry.inflight(me["id"], int(q.get("limit", 50) or 50)))
+
+    def h_dlq(self, a, q) -> None:
+        me = self._me()
+        self._send(200, self.registry.dlq(me["id"], int(q.get("limit", 50) or 50)))
+
+    def h_dlq_requeue(self, a, q) -> None:
+        me = self._me()
+        d = self._body()
+        mid = d.get("message_id")
+        if not mid:
+            self._err(400, "bad_request", "缺少 message_id")
+            return
+        self._send(200, self.registry.dlq_requeue(me["id"], str(mid)))
+
+    def h_dlq_purge(self, a, q) -> None:
+        me = self._me()
+        d = self._body()
+        self._send(200, self.registry.dlq_purge(me["id"], str(d.get("message_id") or "")))
+
+    def h_set_will(self, a, q) -> None:
+        me = self._me()
+        d = self._body()
+        raw = d.get("envelope")
+        if not isinstance(raw, dict):
+            self._err(400, "bad_request", "缺少 envelope（必须是一条已签名的信封）")
+            return
+        env = Envelope.from_dict(raw)
+        self._send(200, self.registry.set_will(
+            me["id"], env, float(d.get("ttl_seconds", 0) or 0)))
+
+    def h_get_will(self, a, q) -> None:
+        me = self._me()
+        self._send(200, self.registry.will_info(me["id"]))
+
+    def h_clear_will(self, a, q) -> None:
+        me = self._me()
+        self._send(200, self.registry.clear_will(me["id"]))
+
     def h_audit(self, a, q) -> None:
         self._send(200, {"audit": self.registry.audit_log(int(q.get("limit", 200) or 200))})
 
@@ -1451,6 +1812,12 @@ def serve(registry: Registry, host: str = "127.0.0.1", port: int = 8787,
                 registry.sweep_proposals()
             except Exception:
                 pass
+            # 遗嘱和超时的群表决共用同一个巡检循环：多一个线程就多一份
+            # 关不干净的负担，而这两件事都不需要秒级精度。
+            try:
+                registry.sweep_wills()
+            except Exception:
+                pass
 
     if block:
         threading.Thread(target=_sweeper, daemon=True).start()
@@ -1463,4 +1830,8 @@ def serve(registry: Registry, host: str = "127.0.0.1", port: int = 8787,
             srv.serve_forever()
         except KeyboardInterrupt:
             print("\n[a2alink] 正在停止…")
+        finally:
+            # shutdown() 只让 serve_forever 退出，监听 socket 还开着。
+            # 不 server_close() 就等 GC —— 常驻进程里这是实打实的 fd 泄漏。
+            srv.server_close()
     return srv

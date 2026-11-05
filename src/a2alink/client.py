@@ -859,6 +859,101 @@ class AgentLink:
         return self._api("POST", "/v1/inbox/ack", {"cursor": cursor or self._cursor})
 
     # ------------------------------------------------------------------
+    # 处理确认：已读 != 做完
+    # ------------------------------------------------------------------
+    def done(self, message_ids: Any) -> Dict[str, Any]:
+        """声明"这些我做完了"。传入单个 ID 或 ID 列表。
+
+        别把它当成 ack 的别名。ack 是传输层的事（位点往前挪），
+        done 是业务层的事（这件事有结果了）。Agent 读完崩掉时，
+        两者必须留下不同的痕迹——否则排查时看到的永远是"一切正常"。
+        """
+        ids = [message_ids] if isinstance(message_ids, str) else list(message_ids or [])
+        if not ids:
+            return {"done": 0}
+        return self._api("POST", "/v1/inbox/done", {"message_ids": ids})
+
+    def fail(self, message_id: str, reason: str = "",
+             requeue: bool = True) -> Dict[str, Any]:
+        """声明"这条我处理不了"。requeue=True 时服务端会重新投一次。"""
+        return self._api("POST", "/v1/inbox/fail",
+                         {"message_id": message_id, "reason": reason,
+                          "requeue": bool(requeue)})
+
+    def inflight(self, limit: int = 50) -> Dict[str, Any]:
+        """已读但没标完成的消息——"可能掉在地上的任务"清单。"""
+        return self._api("GET", "/v1/inbox/inflight", qs=f"limit={int(limit)}")
+
+    def dlq(self, limit: int = 50) -> Dict[str, Any]:
+        return self._api("GET", "/v1/dlq", qs=f"limit={int(limit)}")
+
+    def dlq_requeue(self, message_id: str) -> Dict[str, Any]:
+        return self._api("POST", "/v1/dlq/requeue", {"message_id": message_id})
+
+    def dlq_purge(self, message_id: str = "") -> Dict[str, Any]:
+        return self._api("POST", "/v1/dlq/purge", {"message_id": message_id})
+
+    # ------------------------------------------------------------------
+    # 遗嘱消息
+    # ------------------------------------------------------------------
+    def set_will(self, to: str, text: str, ttl_seconds: int = 600,
+                 force: bool = False, force_reason: str = "") -> Dict[str, Any]:
+        """立遗嘱：预先签好一条消息交给中继保管，掉线后由它代发。
+
+        三个必须在这里做、不能交给服务端的决定：
+        1. **内容先过 DLP**。遗嘱也是一条出站消息，不过闸就等于给自己
+           留了一条"临终泄密"通道——而这恰恰是最容易被忽略的一条。
+        2. **加密在本地做**。中继存的是密文，它自己也读不到遗嘱写的什么。
+        3. **签名在本地做**。中继没有私钥，它只能转交一封已经签好的信。
+        """
+        target = self.resolve(to)
+        trace = new_id("trace-")
+        egress, clean = self.egress.check_payload({"instruction": text})
+        rules = sorted({f.rule for f in egress.findings})
+        fp = fingerprint({"instruction": text})
+        if egress.action == BLOCK:
+            if not force:
+                self._audit("gate.egress", "deny", "egress.deny", trace,
+                            detail={"peer": target, "rules": rules, "will": True},
+                            evidence=fp)
+                raise EgressBlocked(egress)
+            self._audit("gate.egress", "note", "egress.override", trace,
+                        detail={"peer": target, "rules": rules, "will": True,
+                                "force_reason": force_reason, "human_confirmed": True},
+                        evidence=fp)
+
+        ttl = int(ttl_seconds or 0)
+        if ttl and not (30 <= ttl <= 86400):
+            # 不静默钳制。把 5 秒改成 30 秒，用户会以为 5 秒后就有人知道，
+            # 实际要等 30 秒——这种"帮你修正参数"比直接报错危险得多。
+            raise LinkError("bad_ttl", f"遗嘱 TTL 必须在 30~86400 秒之间（收到 {ttl}）")
+        eff = ttl or 600
+        now = time.time()
+        env = Envelope(
+            id=new_id(), from_agent=self.agent_id, to_type="agent", to_id=target,
+            act=ACT_NOTICE, stage=STAGE_DONE, payload=clean,
+            conversation_id=new_id("conv-"), created_at=now,
+            # 遗嘱可能几小时后才发出去，所以有效期要留够；但也必须有尽头——
+            # 一封永不过期的信躺在别人队列里，就是一条永远不会有人收的僵尸任务。
+            expires_at=now + max(3600.0, eff * 6.0),
+            ttl_hops=1, trace_id=trace,
+        )
+        self._seal_and_sign(env, target, False, trace)
+        out = self._api("PUT", "/v1/agents/me/will",
+                        {"envelope": env.to_dict(), "ttl_seconds": ttl})
+        self._audit("gate.egress", "allow", "egress.allow", trace,
+                    detail={"peer": target, "rules": rules, "level": egress.level,
+                            "will": True}, evidence=fp)
+        out["message_id"] = env.id
+        return out
+
+    def clear_will(self) -> Dict[str, Any]:
+        return self._api("DELETE", "/v1/agents/me/will")
+
+    def will_info(self) -> Dict[str, Any]:
+        return self._api("GET", "/v1/agents/me/will")
+
+    # ------------------------------------------------------------------
     # 主循环
     # ------------------------------------------------------------------
     def run(self, handler: Callable[["AgentLink", Received], Optional[Dict[str, Any]]],

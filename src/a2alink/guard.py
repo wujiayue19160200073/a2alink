@@ -225,9 +225,17 @@ class EgressGuard:
         self.redact_at = redact_at
         self.check_entropy = check_entropy
 
+    # 每条规则单独的上限。**不能设全局上限**：
+    #  - "凑满 N 条就 return" → 前面堆 200 个 `10.1.1.1`，后面的身份证规则一条不跑；
+    #  - "按严重度裁到 N 条"  → 内网 IP 和身份证同为 high，堆在前面的仍然把身份证挤掉。
+    # 上限的真实目的只是"防止单条规则刷屏撑爆日志/内存"，所以正确的粒度是
+    # **每条规则各自封顶**，任何一条规则都不能因为另一条规则命中太多而失效。
+    PER_RULE_LIMIT = 20
+
     def _scan(self, text: str) -> List[Finding]:
         out: List[Finding] = []
         for name, rx, sev, cat, repl, hint in _COMPILED_EGRESS:
+            hits = 0
             for m in rx.finditer(text):
                 raw = m.group(0)
                 if any(a in raw for a in self.allow_terms if a):
@@ -236,20 +244,22 @@ class EgressGuard:
                                    excerpt=_mask(raw), hint=hint,
                                    start=m.start(), end=m.end(),
                                    replacement=repl or "[已脱敏]"))
-                if len(out) >= 200:
-                    return out
+                hits += 1
+                if hits >= self.PER_RULE_LIMIT:
+                    break
         for term in self.deny_terms:
             idx = text.find(term)
-            while idx >= 0:
+            hits = 0
+            while idx >= 0 and hits < self.PER_RULE_LIMIT:
                 out.append(Finding(rule="custom_deny_term", severity="critical",
                                    category="custom", excerpt=_mask(term),
                                    hint=f"命中项目自定义禁出词表: {term}",
                                    start=idx, end=idx + len(term),
                                    replacement="[已脱敏:自定义禁出词]"))
                 idx = text.find(term, idx + 1)
-                if len(out) >= 200:
-                    return out
+                hits += 1
         if self.check_entropy:
+            hits = 0
             for m in re.finditer(r"[A-Za-z0-9+/=_\-]{32,}", text):
                 tok = m.group(0)
                 if _entropy(tok) >= 4.2 and not tok.isalpha():
@@ -258,6 +268,10 @@ class EgressGuard:
                                        hint="高熵长串，疑似密钥/密文/会话票据",
                                        start=m.start(), end=m.end(),
                                        replacement="[已脱敏:高熵串]"))
+                    hits += 1
+                    if hits >= self.PER_RULE_LIMIT:
+                        break
+        out.sort(key=lambda f: f.start)
         return out
 
     def classify(self, text: str, findings: List[Finding]) -> str:
@@ -315,19 +329,35 @@ class EgressGuard:
         return GuardResult(ALLOW, findings, text, level, reasons)
 
     def _redact(self, text: str, findings: List[Finding]) -> str:
-        """从后往前替换，避免偏移错位。重叠区间只替换最靠前命中的那条。"""
-        best: Dict[int, Finding] = {}
+        """把命中的片段替换成占位符。
+
+        ⚠️ 必须先把重叠区间**合并**再替换。曾经只按 start 去重、从后往前逐个替换，
+        结果是：`ABCDEFGHIJKLMNOPQRSTUVWXYZ` 上两个重叠区间 (2,15) 与 (8,20)
+        替换完只剩 `AB[X]YZ` —— 26 个字符丢了 18 个。区间是互相重叠的，
+        先换右边会让左边的 end 失效，等于按错误的偏移切文本。
+        合并后每个字符只会被替换一次，长度只在合并后的边界上变化。
+        """
+        spans: List[Tuple[int, int, Finding]] = []
+        n = len(text)
         for f in findings:
-            if f.end <= f.start:
-                continue
-            cur = best.get(f.start)
-            if cur is None or (f.end - f.start) > (cur.end - cur.start):
-                best[f.start] = f
+            s, e = max(0, f.start), min(n, f.end)
+            if e > s:
+                spans.append((s, e, f))
+        if not spans:
+            return text
+        spans.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+
+        merged: List[Tuple[int, int, Finding]] = []
+        for s, e, f in spans:
+            if merged and s < merged[-1][1]:        # 与前一段重叠（相接不算）
+                ps, pe, pf = merged[-1]
+                merged[-1] = (ps, max(pe, e), pf)   # 保留先命中的那条的占位符
+            else:
+                merged.append((s, e, f))
+
         out = text
-        for start in sorted(best.keys(), reverse=True):
-            f = best[start]
-            if f.end <= len(out):
-                out = out[:f.start] + f.replacement + out[f.end:]
+        for s, e, f in reversed(merged):            # 从后往前，前面偏移才不失效
+            out = out[:s] + f.replacement + out[e:]
         return out
 
     def check_payload(self, payload: Dict[str, Any]) -> Tuple[GuardResult, Dict[str, Any]]:

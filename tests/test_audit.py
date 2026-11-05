@@ -18,6 +18,21 @@ from a2alink.audit import (AuditError, AuditLog, OVERRIDE_REASONS, REASONS,
                            _digest, mask, scrub)
 
 
+def _read(path: str, mode: str = "r"):
+    """测试里读文件统一走这里。裸 open().read() 会漏文件句柄，
+    跑多了就是满屏 ResourceWarning，把真正的告警淹掉。"""
+    if "b" in mode:
+        with open(path, mode) as fh:
+            return fh.read()
+    with open(path, mode, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _write(path: str, text: str) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
 class TestScrub(unittest.TestCase):
     def test_credentials_removed(self):
         s = scrub("AK 是 AKIAIOSFODNN7EXAMPLE，密码 password=hunter2，"
@@ -66,7 +81,7 @@ class TestChain(unittest.TestCase):
         self.log.write("gate.egress", "deny", "egress.deny", trace="t1",
                        detail={"peer": "agt-x"},
                        preview="服务器 10.20.31.7 上 AKIAIOSFODNN7EXAMPLE 报错")
-        raw = open(self._path(), encoding="utf-8").read()
+        raw = _read(self._path())
         self.assertNotIn("10.20.31.7", raw)
         self.assertNotIn("AKIAIOSFODNN7EXAMPLE", raw)
         # 但仍然要留下可排查的线索
@@ -79,7 +94,7 @@ class TestChain(unittest.TestCase):
         self.log.write("gate.egress", "allow", "egress.allow",
                        detail={"peer": "agt-a2a4bbd8e65f4694883cf746",
                                "conv": "conv-abc123def456", "n": 3})
-        rec = json.loads(open(self._path(), encoding="utf-8").read().splitlines()[0])
+        rec = json.loads(_read(self._path()).splitlines()[0])
         self.assertEqual(rec["detail"]["peer"], "agt-a2a4bbd8e65f4694883cf746")
         self.assertEqual(rec["detail"]["conv"], "conv-abc123def456")
 
@@ -88,7 +103,7 @@ class TestChain(unittest.TestCase):
         why = "对方是甲方安全负责人，已电话确认可以提供测试密钥"
         self.log.write("gate.egress", "note", "egress.override",
                        detail={"peer": "agt-x", "force_reason": why})
-        rec = json.loads(open(self._path(), encoding="utf-8").read().splitlines()[0])
+        rec = json.loads(_read(self._path()).splitlines()[0])
         self.assertEqual(rec["detail"]["force_reason"], why)
 
     def test_unknown_reason_rejected(self):
@@ -100,11 +115,11 @@ class TestChain(unittest.TestCase):
         for i in range(4):
             self.log.write("e", "allow", "egress.allow", trace=f"t{i}")
         p = self._path()
-        lines = open(p, encoding="utf-8").read().splitlines()
+        lines = _read(p).splitlines()
         d = json.loads(lines[1])
         d["decision"] = "deny"
         lines[1] = json.dumps(d, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        open(p, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+        _write(p, "\n".join(lines) + "\n")
         rep = self.log.verify()
         self.assertFalse(rep["ok"])
         self.assertIn("hash_mismatch", {e["kind"] for e in rep["errors"]})
@@ -113,8 +128,8 @@ class TestChain(unittest.TestCase):
         for i in range(5):
             self.log.write("e", "allow", "egress.allow", trace=f"t{i}")
         p = self._path()
-        lines = open(p, encoding="utf-8").read().splitlines()
-        open(p, "w", encoding="utf-8").write("\n".join([lines[0], lines[3]]) + "\n")
+        lines = _read(p).splitlines()
+        _write(p, "\n".join([lines[0], lines[3]]) + "\n")
         kinds = {e["kind"] for e in self.log.verify()["errors"]}
         self.assertIn("seq_gap", kinds)
         self.assertIn("prev_mismatch", kinds)
@@ -123,8 +138,8 @@ class TestChain(unittest.TestCase):
         for i in range(4):
             self.log.write("e", "allow", "egress.allow")
         p = self._path()
-        lines = open(p, encoding="utf-8").read().splitlines()
-        open(p, "w", encoding="utf-8").write("\n".join(lines[:2]) + "\n")
+        lines = _read(p).splitlines()
+        _write(p, "\n".join(lines[:2]) + "\n")
         kinds = {e["kind"] for e in self.log.verify()["errors"]}
         self.assertIn("tail_truncated", kinds)
 
@@ -209,10 +224,10 @@ class TestRestartAndSeal(unittest.TestCase):
         a.write("e", "allow", "egress.allow")
         path = a._path
         a.close()
-        before = open(path, "rb").read()
+        before = _read(path, "rb")
         ro = AuditLog(self.root, "cli", readonly=True)
         self.assertIsNone(ro.write("e", "allow", "egress.allow"))
-        self.assertEqual(open(path, "rb").read(), before)
+        self.assertEqual(_read(path, "rb"), before)
 
 
 if __name__ == "__main__":

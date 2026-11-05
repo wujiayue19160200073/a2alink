@@ -68,7 +68,12 @@ def cmd_registry(args: argparse.Namespace) -> int:
     if mesh:
         print("[a2alink] 同机互信已开启（local_mesh）：本机会话互发消息免好友审批，"
               "每次放行都会写入审计。", file=sys.stderr)
-    serve(reg, host=args.host, port=args.port, verbose=args.verbose)
+    try:
+        serve(reg, host=args.host, port=args.port, verbose=args.verbose)
+    finally:
+        # Ctrl-C 退出也要关连接：WAL 模式下不关会留下 -wal/-shm，
+        # 下次启动虽然能恢复，但"干净退出"应该是默认而不是运气。
+        reg.close()
     return 0
 
 
@@ -1053,6 +1058,30 @@ def cmd_skill(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------- up
+def _set_will_if_asked(args: argparse.Namespace) -> None:
+    """`up --will ... --will-to ...` 的落地。
+
+    为什么不设计成"单独一条命令"：那样用户会在"起来了"和"立遗嘱"之间
+    漏掉第二步，而漏掉的后果正是这个功能要防的事——崩溃时没人知道。
+    高频动作里能合并的步骤，不要留给记性。
+    """
+    text = str(getattr(args, "will_text", "") or "").strip()
+    if not text:
+        return
+    to = str(getattr(args, "will_to", "") or "").strip()
+    if not to:
+        print("⚠️  给了 --will 但没给 --will-to，遗嘱没立（不知道发给谁）。",
+              file=sys.stderr)
+        return
+    try:
+        c, _ = _session_client(args)
+        out = c.set_will(_resolve_target(to), text,
+                         ttl_seconds=int(getattr(args, "will_ttl", 600)))
+        print(f"📜 遗嘱已立：{out['deliver_after']} 秒无动静就通知 {to}")
+    except Exception as e:
+        print(f"⚠️  遗嘱没立上：{e}", file=sys.stderr)
+
+
 def cmd_up(args: argparse.Namespace) -> int:
     from . import autostart
     try:
@@ -1061,6 +1090,8 @@ def cmd_up(args: argparse.Namespace) -> int:
     except autostart.AutoStartError as e:
         print(f"❌ {e}", file=sys.stderr)
         return 2
+    # 中继起来之后再立遗嘱，否则没地方存它。
+    _set_will_if_asked(args)
     if not out.get("managed"):
         print(f"远端注册中心：{'在线' if out.get('alive') else '不可达'}  {args.registry}")
         return 0 if out.get("alive") else 3
@@ -1072,6 +1103,17 @@ def cmd_up(args: argparse.Namespace) -> int:
 
 def cmd_down(args: argparse.Namespace) -> int:
     from . import autostart
+    # 正常下线用不上遗嘱——遗嘱是给"意外消失"准备的。
+    # 不撤的话，对方会在十分钟后收到一条"我掉线了"，而人其实好好的。
+    if not getattr(args, "keep_will", False):
+        try:
+            c, _ = _session_client(args)
+            info = c.will_info()
+            if info.get("will") and not info.get("fired"):
+                c.clear_will()
+                print("📜 遗嘱已撤销（正常下线，用不上它）")
+        except Exception:
+            pass
     out = autostart.stop(args.registry)
     if out.get("stopped"):
         return 0
@@ -1290,7 +1332,8 @@ def cmd_check(args: argparse.Namespace) -> int:
                     print(f"   {line}")
                 print("   </untrusted_external_content>")
             if r.env.act == "task":
-                print(f"   ↳ 这是提问，回话：a2alink reply {r.env.id} \"...\"")
+                print(f"   ↳ 回话：a2alink reply {r.env.id} \"...\"")
+                print(f"   ↳ 做完：a2alink done {r.env.id}")
             else:
                 print(f"   ↳ 要回也可以：a2alink reply {r.env.id} \"...\"")
 
@@ -1337,6 +1380,121 @@ def cmd_peers(args: argparse.Namespace) -> int:
             caps = ",".join(a.get("capabilities") or []) or "-"
             print(f"  · {a['name']:<20} caps={caps}")
     return 0
+
+
+# ------------------------------------------------------- done / fail / inflight
+def cmd_done(args: argparse.Namespace) -> int:
+    """标记处理完成。不做这一步，消息就永远挂在 inflight 里。"""
+    try:
+        c, _ = _session_client(args)
+        out = c.done(args.message_id)
+    except Exception as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 2
+    n = out.get("done", 0)
+    if not n:
+        print("没有可标记的消息（可能已经标过，或这些 ID 不是投给你的）。")
+        return 0
+    print(f"✅ 已标记 {n} 条为处理完成。")
+    return 0
+
+
+def cmd_fail(args: argparse.Namespace) -> int:
+    try:
+        c, _ = _session_client(args)
+        out = c.fail(args.message_id, reason=args.reason,
+                     requeue=not args.no_requeue)
+    except Exception as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 2
+    print(f"已记录失败：第 {out['attempts']}/{out['max_attempts']} 次")
+    if out["dead"]:
+        print("⛔ 重投次数用尽，这条已进死信队列。")
+        print("   查看：a2alink dlq list")
+        print(f"   重投：a2alink dlq requeue {args.message_id}")
+    elif out["requeued"]:
+        print("↻ 已重新投递，下次 check 会再收到它。")
+    return 0
+
+
+def cmd_inflight(args: argparse.Namespace) -> int:
+    try:
+        c, _ = _session_client(args)
+        out = c.inflight(limit=args.limit)
+    except Exception as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 2
+    items = out.get("items", [])
+    if not items:
+        print("没有挂着的任务，收到的消息都已标记完成。")
+        return 0
+    print(f"⚠️  {len(items)} 条已读但未标记完成（可能就是掉在地上的任务）：")
+    names = _name_map(c)
+    for it in items:
+        who = names.get(it.get("from_agent")) or it.get("from_agent")
+        print(f"  · {it['id']}  来自 {who}  {_rel(it.get('created_at'))}")
+        if it.get("attempts"):
+            print(f"    失败 {it['attempts']} 次：{it.get('fail_reason') or '-'}")
+    print("\n做完用：a2alink done <id>    做不了用：a2alink fail <id> --reason \"...\"")
+    return 0
+
+
+def cmd_dlq(args: argparse.Namespace) -> int:
+    try:
+        c, _ = _session_client(args)
+        if args.action == "list":
+            items = c.dlq(limit=args.limit).get("items", [])
+            if not items:
+                print("死信队列是空的。")
+                return 0
+            names = _name_map(c)
+            print(f"死信 {len(items)} 条（重投次数用尽的消息）：")
+            for it in items:
+                who = names.get(it.get("from_agent")) or it.get("from_agent")
+                print(f"  · {it['id']}  来自 {who}  失败 {it['attempts']} 次")
+                print(f"    原因：{it.get('fail_reason') or '-'}")
+            print("\n重投：a2alink dlq requeue <id>    清理：a2alink dlq purge <id>")
+            return 0
+        if args.action == "requeue":
+            out = c.dlq_requeue(args.message_id)
+            print(f"↻ 已重新投递 {out['message_id']}，下次 check 会收到。")
+            return 0
+        out = c.dlq_purge(getattr(args, "message_id", "") or "")
+        print(f"已清理 {out['purged']} 条死信（只做标记，审计记录不会被删）。")
+        return 0
+    except Exception as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 2
+
+
+# ------------------------------------------------------------------ will
+def cmd_will(args: argparse.Namespace) -> int:
+    try:
+        c, _ = _session_client(args)
+        if args.action == "set":
+            out = c.set_will(_resolve_target(args.to), args.text, ttl_seconds=args.ttl)
+            print(f"✅ 遗嘱已立：{out['deliver_after']} 秒没动静就发给 {args.to}")
+            print("   中继只能转交这封已签名的信；内容在本地加密，它自己读不到。")
+            print("   撤销：a2alink will clear")
+            return 0
+        if args.action == "clear":
+            c.clear_will()
+            print("✅ 遗嘱已撤销。")
+            return 0
+        info = c.will_info()
+        if not info.get("will"):
+            print("当前没有遗嘱。")
+            print('  立一个：a2alink will set @某人 "我掉线了，手上的任务没做完" --ttl 600')
+            return 0
+        state = "已触发" if info.get("fired") else "待触发"
+        to_id = str(info.get("to") or "")
+        to_show = _name_map(c).get(to_id) or to_id
+        print(f"遗嘱{state}：{int(info['ttl_seconds'])} 秒无动静后发给 {to_show}")
+        print(f"  消息 ID：{info.get('message_id')}")
+        return 0
+    except Exception as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 2
 
 
 # ==========================================================================
@@ -1392,8 +1550,17 @@ def build_parser() -> argparse.ArgumentParser:
     u = sub.add_parser("up", help="确保本地中继在跑（不在就拉起来）")
     u.add_argument("--no-mesh", dest="no_mesh", action="store_true",
                    help="关闭同机会话互信（默认开启）")
+    u.add_argument("--will", dest="will_text", default="",
+                   help="立遗嘱：掉线时替你发出去的那句话")
+    u.add_argument("--will-to", dest="will_to", default="",
+                   help="遗嘱发给谁（@名字），不给就不立")
+    u.add_argument("--will-ttl", dest="will_ttl", type=int, default=600,
+                   help="多少秒无动静算掉线（默认 600）")
     u.set_defaults(func=cmd_up)
-    sub.add_parser("down", help="停掉本工具拉起的本地中继").set_defaults(func=cmd_down)
+    dw = sub.add_parser("down", help="停掉本工具拉起的本地中继")
+    dw.add_argument("--keep-will", dest="keep_will", action="store_true",
+                    help="保留遗嘱（默认正常下线会撤销，避免误发）")
+    dw.set_defaults(func=cmd_down)
 
     sy = sub.add_parser("say", help="给某个对话发消息（不等回复）")
     sy.add_argument("to", help="会话别名(@运维)、agent 名或 agent_id")
@@ -1431,6 +1598,43 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("peers", help="本机有哪些对话、中继上还有谁").set_defaults(
         func=cmd_peers)
+
+    dn = sub.add_parser("done", help="标记消息已处理完（和「已读」不是一回事）")
+    dn.add_argument("message_id", nargs="+", help="一个或多个消息 ID")
+    dn.set_defaults(func=cmd_done)
+
+    fl = sub.add_parser("fail", help="上报处理失败：默认重投，超次数进死信")
+    fl.add_argument("message_id")
+    fl.add_argument("--reason", default="", help="失败原因，会写进审计")
+    fl.add_argument("--no-requeue", action="store_true", help="不重投，只记一次失败")
+    fl.set_defaults(func=cmd_fail)
+
+    inf = sub.add_parser("inflight", help="已读但没标完成的消息（可能掉地上的任务）")
+    inf.add_argument("--limit", type=int, default=50)
+    inf.set_defaults(func=cmd_inflight)
+
+    dq = sub.add_parser("dlq", help="死信队列：查看 / 重投 / 清理")
+    dqs = dq.add_subparsers(dest="action", required=True)
+    ql = dqs.add_parser("list", help="列出死信")
+    ql.add_argument("--limit", type=int, default=50)
+    ql.set_defaults(func=cmd_dlq)
+    qr = dqs.add_parser("requeue", help="重新投递一条死信")
+    qr.add_argument("message_id")
+    qr.set_defaults(func=cmd_dlq)
+    qp = dqs.add_parser("purge", help="清理死信（只标记，不删审计）")
+    qp.add_argument("message_id", nargs="?", default="")
+    qp.set_defaults(func=cmd_dlq)
+
+    wl = sub.add_parser("will", help="遗嘱：我掉线了，替我把这句话发出去")
+    wls = wl.add_subparsers(dest="action", required=True)
+    wset = wls.add_parser("set", help="立遗嘱（中继保管的是已签名信封）")
+    wset.add_argument("to", help="掉线后通知谁")
+    wset.add_argument("text", help="要说的内容")
+    wset.add_argument("--ttl", type=int, default=600,
+                      help="多少秒没动静算掉线（默认 600）")
+    wset.set_defaults(func=cmd_will)
+    wls.add_parser("show", help="查看当前遗嘱").set_defaults(func=cmd_will)
+    wls.add_parser("clear", help="撤销遗嘱").set_defaults(func=cmd_will)
 
     r = sub.add_parser("registry", help="启动注册中心")
     r.add_argument("--db", default="a2alink.sqlite3")

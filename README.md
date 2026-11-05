@@ -120,6 +120,31 @@ a2alink check                             # 收信 + 摘要
 a2alink peers                             # 本机有哪些对话
 ```
 
+### 收下之后，还要说"做完了"
+
+`check` 只代表"我读到了"。**读到不等于做完**——读完可能崩溃、可能转手、
+可能发现自己做不了。所以收到任务后还要显式说一句：
+
+```bash
+a2alink done <消息ID>                     # 我做完了
+a2alink fail <消息ID> --reason "缺日志"    # 我做不了（默认重投，3 次后进死信）
+a2alink inflight                          # 已读但没标完成的——可能掉地上的任务
+a2alink dlq list                          # 重投次数用尽的
+```
+
+不做这一步，消息会一直挂在 `inflight` 里。这是刻意的：一个会自动消失的
+待办列表，最后一定会变成没人看的列表。
+
+**崩溃也不至于无人知晓**：
+
+```bash
+a2alink up --will "我掉线了，手上的回归没跑完" --will-to @运维 --ttl 600
+```
+
+十分钟没动静就把这句话发给 @运维。中继只能转交这封**你已经签好名**的信，
+它自己造不出来，也读不到内容（本地已加密）。`a2alink down` 默认撤销遗嘱——
+正常下线用不上它。
+
 ### 它是怎么认出"不同对话"的
 
 宿主的会话 ID（`CODEBUDDY_SESSION_ID` / `CLAUDE_SESSION_ID`）一个对话窗口一个。
@@ -508,6 +533,11 @@ a2alink keys pin <对端> --expect <你从电话里听到的指纹> --yes
 | `a2alink say @名字 "内容"` | 发消息，不等回复 |
 | `a2alink ask @名字 "问题" --wait 30` | 提问并等回答；超时如实说超时，不重试 |
 | `a2alink reply <消息ID> "内容"` | 回复某条消息（`stage=done`，这条链结束） |
+| `a2alink done <消息ID>` | **标记处理完成**（收信不等于做完，不做这步就一直挂在 inflight） |
+| `a2alink fail <消息ID> --reason "..."` | 上报处理失败，超阈值进死信队列 |
+| `a2alink inflight` | 已读但没标完成的消息——**可能掉在地上的任务** |
+| `a2alink dlq list/requeue/purge` | 死信队列：查看 / 重投 / 清理 |
+| `a2alink will set/show/clear` | 遗嘱：我掉线了，替我发这句话 |
 | `a2alink peers` | 本机有哪些对话、中继上还有谁 |
 | `a2alink registry` | 起注册中心（默认 127.0.0.1） |
 | `a2alink whoami` | 我是谁、我的出站策略、我的看门狗阈值 |
@@ -579,9 +609,10 @@ a2alink keys pin <对端> --expect <你从电话里听到的指纹> --yes
 | v0.1.1 | 两段式入群准入 + 反滥用 + 许可切换 | 已发布 |
 | v0.1.2 | 可追责审计链（哈希链 + 理由码 + `trace`/`incident`） | 已发布 |
 | v0.2.0 | Ed25519 签名 + X25519 端到端加密 + 公钥固定 | 已发布 |
-| **v0.3.0** | **一键装成 Skill + 跨对话信箱（会话身份 / 自动中继 / 同机互信）** | **当前** |
-| v0.4.0 | 本地可视化会话台（看得见 Agent 在聊什么）· [设计稿](docs/visual-console.md) | 规划 |
-| v0.5.0 | 真实框架适配器打磨 + relay 转发（带四道闸） | 规划 |
+| v0.3.0 | 一键装成 Skill + 跨对话信箱（会话身份 / 自动中继 / 同机互信） | 已发布 |
+| **v0.4.0** | **可靠投递：已读≠做完、死信队列、遗嘱消息、回复链** | **当前** |
+| v0.5.0 | 本地可视化会话台（看得见 Agent 在聊什么）· [设计稿](docs/visual-console.md) | 规划 |
+| v0.6.0 | 真实框架适配器打磨 + relay 转发（带四道闸） | 规划 |
 | v1.0.0 | 信封协议冻结 | 规划 |
 
 语义化版本规则、"什么算破坏性"、弃用流程见 [docs/VERSIONING.md](docs/VERSIONING.md)。
@@ -597,6 +628,12 @@ a2alink keys pin <对端> --expect <你从电话里听到的指纹> --yes
 - ❌ 不做群发/广播接口（一次只能发一个目标，这是刻意的）
 - ❌ 不做"被拉进群就默认同意"（本人点头是硬约束）
 - ❌ 不承诺 exactly-once（分布式下这是谎话，我们做 at-least-once + 幂等）
+- ❌ 不做**自动重投**：超时自动重发要后台租约与心跳，复杂度接近一个小型 broker，
+  而在 Agent 场景里"任务有没有结果"比"消息重投了几次"更要紧。
+  先让失败**可见**（`inflight`/`dlq`），再谈自动恢复
+- ❌ 不做接收侧**副作用去重**：`idempotency_key` 在协议里有，
+  但"同一个 ID 第二次到达时跳过业务动作"是**适配器**的责任。
+  这一点最容易被误以为协议已经保证，所以写在这里
 
 ---
 
@@ -604,19 +641,23 @@ a2alink keys pin <对端> --expect <你从电话里听到的指纹> --yes
 
 ```
 src/a2alink/
-  protocol.py   信封定义与校验（零依赖）
+  protocol.py   信封定义与校验（含回复链 references）
   watchdog.py   循环治理：TTL / 预算 / 指纹 / 熔断
   guard.py      出站 DLP + 入站注入检测 + 合规清单
   crypto.py     Ed25519 签名 + X25519 交换 + HKDF + AEAD（纯 Python）
   trust.py      对端公钥固定（TOFU / strict / off）
   abuse.py      滥用防护：扩散保险丝 + 转发署名闸门
-  registry.py   注册中心（控制面，SQLite + 标准库 HTTP）
+  audit.py      可追责审计：哈希链 + 理由码 + 证据包
+  sessions.py   会话即身份（宿主会话 ID → 稳定 agent）
+  autostart.py  本地中继自启（只对回环地址生效）
+  skillpack.py  一键装成 Skill（SKILL.md + 启动器）
+  registry.py   注册中心（控制面 + 邮箱 / 死信 / 遗嘱巡检）
   client.py     SDK（闸门内置）
   adapters.py   框架适配 + tool schema
   cli.py        命令行
   demo.py       60 秒演示
-tests/          78 个测试（含端到端）
-docs/           架构评审 / 线协议 / 滥用威胁模型 / 版本规划 / v0.2 设计稿
+tests/          235 个测试（含端到端）
+docs/           架构决策 / 线协议 / 通信架构调研 / 威胁模型 / 版本规划
 ```
 
 零第三方依赖，`PYTHONPATH=src python -m unittest discover -s tests` 即可验证。

@@ -36,6 +36,8 @@ class Base(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown()
+        cls.srv.server_close()   # shutdown 不关监听 socket
+        cls.reg.close()          # 不关就靠 GC，测试跑多了会攒出 fd 泄漏
 
     def client(self, name, caps=()):
         return AgentLink(registry=self.url, name=name, capabilities=list(caps),
@@ -331,6 +333,7 @@ class TestRegistryDirect(unittest.TestCase):
     def test_invite_code_required(self):
         tmp = tempfile.mkdtemp()
         reg = Registry(os.path.join(tmp, "i.sqlite3"), invite_code="s3cret")
+        self.addCleanup(reg.close)
         with self.assertRaises(Exception):
             reg.register("nope", [])
         out = reg.register("yep", [], invite_code="s3cret")
@@ -339,6 +342,7 @@ class TestRegistryDirect(unittest.TestCase):
     def test_audit_written(self):
         tmp = tempfile.mkdtemp()
         reg = Registry(os.path.join(tmp, "a.sqlite3"))
+        self.addCleanup(reg.close)
         reg.register("audit-a", [])
         log = reg.audit_log(10)
         self.assertTrue(any(x["action"] == "register" for x in log))
@@ -359,6 +363,8 @@ class TestAuditTrail(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown()
+        cls.srv.server_close()   # shutdown 不关监听 socket
+        cls.reg.close()          # 不关就靠 GC，测试跑多了会攒出 fd 泄漏
 
     def client(self, name):
         return AgentLink(registry=self.url, name=name,
@@ -378,7 +384,8 @@ class TestAuditTrail(unittest.TestCase):
         self.assertTrue(hit, "DLP 拦截必须留下理由码记录")
         self.assertIn("cloud_ak", hit[0]["detail"]["rules"])
         # 拦截记录里不能有明文密钥
-        raw = open(a.audit._path, encoding="utf-8").read()
+        with open(a.audit._path, encoding="utf-8") as fh:
+            raw = fh.read()
         self.assertNotIn("AKIAIOSFODNN7EXAMPLE", raw)
 
     def test_force_without_reason_is_refused_and_logged(self):
@@ -432,6 +439,7 @@ class TestAuditTrail(unittest.TestCase):
         """清理业务数据时不许顺手删审计——那是最好用的洗证据方式。"""
         tmp = tempfile.mkdtemp()
         reg = Registry(os.path.join(tmp, "p.sqlite3"))
+        self.addCleanup(reg.close)
         reg.register("pa", [])
         before = len(reg.audit_log(200))
         reg.purge_old(days=0)
