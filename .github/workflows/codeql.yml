@@ -24,15 +24,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@v4
         with:
           languages: python
-          # 默认查询集。用 security-extended 会多出大量风格类告警，
-          # 而没人看的告警等于没有告警——先让默认集保持接近零噪音。
-          queries: default
+          # 刻意不写 queries：不指定就是默认查询集。
+          # 之前写死 `queries: default` 导致 database init 直接 fatal error ——
+          # 这个选项只在挂自定义查询包（如 security-extended）时才该出现，
+          # "default" 会被当成一个包名去解析然后找不到。
+          # 也不建议一上来就用 security-extended：几百条风格告警会让人整套忽略。
 
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@v4
         with:
           category: "/language:python"

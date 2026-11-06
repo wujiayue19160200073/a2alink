@@ -42,9 +42,9 @@ jobs:
       # 刻意**不设** PYTHONUTF8=1：Windows 默认 cp1252，如果打印中文/符号会炸，
       # 那是用户真实会遇到的问题，CI 应该把它暴露出来而不是替它掩盖。
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
 
@@ -61,9 +61,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
