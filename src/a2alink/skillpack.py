@@ -80,11 +80,27 @@ for candidate in (OVERRIDE, SRC):
         sys.path.insert(0, candidate)
         break
 else:
-    sys.stderr.write(
+    # 编码降级：英文版 Windows 的 stderr 是 cp1252，写中文时 Python 会用
+    # backslashreplace 把它变成 \u6e90\u7801 这样的字面量 —— 用户读到的是一坨转义，
+    # 比英文更糟。所以先试编码，编码不了就给英文说明。
+    # 不用 reconfigure 成 utf-8：真正的 cp1252 控制台会把 utf-8 字节显示成乱码。
+    _zh = (
         "a2alink 的源码目录找不到了：" + chr(10)
         + "  " + str(SRC) + chr(10)
         + "如果你移动过仓库，请重新执行 a2alink skill install --force；" + chr(10)
         + "或者设置环境变量 A2ALINK_SRC 指向新的 src 目录。" + chr(10))
+    _en = (
+        "a2alink: source directory not found:" + chr(10)
+        + "  " + str(SRC) + chr(10)
+        + "If the repo was moved, run: a2alink skill install --force" + chr(10)
+        + "or set A2ALINK_SRC to the new src directory." + chr(10))
+    _enc = getattr(sys.stderr, "encoding", None) or "ascii"
+    try:
+        _zh.encode(_enc)
+        _msg = _zh
+    except (UnicodeEncodeError, LookupError):
+        _msg = _en
+    sys.stderr.write(_msg)
     raise SystemExit(2)
 
 from a2alink.cli import main  # noqa: E402

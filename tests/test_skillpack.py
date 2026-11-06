@@ -122,8 +122,35 @@ class TestLauncherRuns(unittest.TestCase):
         r = subprocess.run([sys.executable, broken, "--version"],
                            capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 2)
-        self.assertIn("源码目录找不到了", r.stderr)
+        # 断言"有没有说清下一步"，而不是断言中文字面量：
+        # 英文 Windows 的 stderr 编码不了中文，启动器会降级成英文说明。
+        self.assertIn("nonexistent", r.stderr)
         self.assertIn("A2ALINK_SRC", r.stderr)
+        self.assertTrue(
+            "源码目录找不到了" in r.stderr or "source directory not found" in r.stderr,
+            r.stderr,
+        )
+
+    def test_non_utf8_console_gets_readable_message(self):
+        """cp1252 控制台下不许吐 \\uXXXX 转义。
+
+        CI 在 windows-latest 上抓到的真 bug：中文写进 cp1252 的 stderr 时，
+        Python 的 backslashreplace 会把它变成字面量 \\u6e90\\u7801\\u76ee\\u5f55，
+        用户看到的是一堆转义而不是一句人话。
+        """
+        with open(self.launcher, encoding="utf-8") as fh:
+            text = fh.read()
+        broken = os.path.join(self.root, "broken_cp1252.py")
+        with open(broken, "w", encoding="utf-8") as f:
+            f.write(text.replace(repr(skillpack.package_src_root()),
+                                 repr(os.path.join(self.root, "nonexistent"))))
+        env = dict(os.environ, PYTHONIOENCODING="cp1252")
+        r = subprocess.run([sys.executable, broken, "--version"],
+                           capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(r.returncode, 2)
+        self.assertNotRegex(r.stderr, r"\\u[0-9a-f]{4}",
+                            f"输出里有转义乱码，用户读不懂: {r.stderr!r}")
+        self.assertIn("source directory not found", r.stderr)
 
 
 class TestSkillGuardrails(unittest.TestCase):
