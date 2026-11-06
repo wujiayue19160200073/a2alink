@@ -1,0 +1,90 @@
+name: tests
+
+# 只做一件事：证明"零依赖 + 跨平台 + 多版本"这三个 README 上的承诺是真的。
+# 刻意不做的事：不跑 lint、不跑发布、不装任何依赖。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false        # 一个挂了也要看到其余结果，否则修一轮只能知道一个问题
+      matrix:
+        # 三个 OS 各跑边界版本；中间版本只在 Linux 上补全，
+        # 因为版本兼容性跟内核无关，而平台差异跟 OS 强相关。
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.13"]
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: ubuntu-latest
+            python: "3.14"
+    env:
+      # Windows 的 shell 是 pwsh，`PYTHONPATH=src python ...` 这种写法会直接失败。
+      # 用 job 级 env 才能让三个平台跑同一条命令。
+      PYTHONPATH: src
+      # 刻意**不设** PYTHONUTF8=1：Windows 默认 cp1252，如果打印中文/符号会炸，
+      # 那是用户真实会遇到的问题，CI 应该把它暴露出来而不是替它掩盖。
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 环境信息
+        run: python -c "import sys, platform; print(sys.version); print(platform.platform()); print('stdio:', sys.stdout.encoding)"
+
+      - name: 全量测试
+        run: python -m unittest discover -s tests
+
+  package:
+    # 单开一个 job 验证"能被装起来"。很多人 pyproject 写错，直到发版才发现——
+    # 而 README 第一屏就是 pip install -e .，装不上等于文档撒谎。
+    name: 打包与入口脚本
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 构建 wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: 装到干净环境并跑入口脚本
+        run: |
+          python -m venv /tmp/verify
+          /tmp/verify/bin/pip install dist/*.whl
+          /tmp/verify/bin/a2alink --help
+
+      - name: 确认没有偷偷引入依赖
+        # dependencies = [] 是本项目的核心承诺之一，必须自动验证。
+        run: |
+          /tmp/verify/bin/python -c "
+          import importlib.metadata as m
+          deps = m.requires('a2alink') or []
+          hard = [d for d in deps if 'extra ==' not in d]
+          print('运行期依赖:', hard or '(无)')
+          assert not hard, f'零依赖承诺被破坏: {hard}'
+          "

@@ -5,6 +5,9 @@
 零第三方依赖 · 单文件 SQLite · 本地优先 · 端到端加密 + 消息签名
 · 内置防泄密闸门与死循环看门狗
 
+[![tests](https://github.com/wujiayue19160200073/a2alink/actions/workflows/tests.yml/badge.svg)](https://github.com/wujiayue19160200073/a2alink/actions/workflows/tests.yml)
+[![codeql](https://github.com/wujiayue19160200073/a2alink/actions/workflows/codeql.yml/badge.svg)](https://github.com/wujiayue19160200073/a2alink/actions/workflows/codeql.yml)
+
 当前版本 **v0.5.0** · [变更记录](CHANGELOG.md) · [版本规划](docs/VERSIONING.md) ·
 [许可：非商业免费 / 商用需授权](COMMERCIAL.md)
 

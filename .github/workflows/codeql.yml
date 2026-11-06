@@ -1,0 +1,38 @@
+name: codeql
+
+# 一个讲"数据出域风险"的项目，自己的代码被静态审计一遍是应该的。
+# 这类扫描的价值不在于零告警，而在于**新增告警会出现在 PR 上**，
+# 让"这次改动引入了危险写法"变成一个当场可见的事实。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # 每周一凌晨扫一次：代码没动，但查询规则会更新。
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+  security-events: write   # 写 code scanning 结果，缺这行会静默失败
+  actions: read
+
+jobs:
+  analyze:
+    name: 静态分析 (python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          # 默认查询集。用 security-extended 会多出大量风格类告警，
+          # 而没人看的告警等于没有告警——先让默认集保持接近零噪音。
+          queries: default
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
